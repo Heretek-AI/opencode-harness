@@ -1,0 +1,132 @@
+# Wave 3 QA Red-Proof Log — Unified OpenCode v2 Plugin Entrypoint
+# Date: 2026-10-15 | Branch: wave-3-plugin-entry | Worktree: worktrees/wave-3
+# QA Agent: agency-qa | Spec: docs/prompts/SPEC.md §§2.3/2.4/2.5
+#
+# Protocol: every acceptance check run green; each sabotage proves the
+# suite FAILS when broken (no vacuous pass); every sabotage reverted via
+# `git checkout -- <file>` with `git status --short` clean afterwards.
+
+## 0. Baseline: full acceptance (all exit 0)
+
+$ make check
+MAKE_CHECK_EXIT:0
+- bun run check (tsc --noEmit): exit 0, zero diagnostics
+- bun test: 161 pass, 0 fail, 543 expect() calls across 8 files (see /tmp/opencode/final-check.log)
+
+$ bash scripts/accept/wave-1.sh
+W1_EXIT:0  → "WAVE 1 ACCEPT: ALL GATES GREEN" (62 pass subset + export/scope gates)
+
+$ bash scripts/accept/wave-2.sh
+W2_EXIT:0  → "WAVE 2 ACCEPT: ALL GATES GREEN" (161 pass full + KV/DOM invariant gates)
+
+$ bash scripts/accept/wave-3.sh
+W3_EXIT:0  → "WAVE 3 ACCEPT: ALL GATES GREEN" (typecheck, full suite, wave-1/2
+regressions, zero-stub scan, 18 SPEC-2.5 export checks, 8 wiring checks,
+plugin coverage, MCP exactness, scope-refusal)
+
+$ make accept   # runs wave-1.sh && wave-2.sh && wave-3.sh
+EXIT:0 (tail shows "WAVE 3 ACCEPT: ALL GATES GREEN")
+
+$ git status --short   # before sabotage
+(clean — no output)
+GITSTATUS_EXIT:0
+
+## 1. RED-PROOF A — Break plugin entrypoint (SPEC §2.5 tool registration)
+
+Condition asserted: `activate`/`buildHarnessTools` registers exactly the five
+tools `file_hash_read, file_hash_edit, ast_structural_search,
+ast_structural_rewrite, ui_geometry_audit` (HARNESS_TOOL_NAMES ↔ tool table).
+
+Sabotage (minimal, via native edit — no bash file writes):
+  file: src/index.ts
+  old: export const HARNESS_TOOL_NAMES = [\n  "file_hash_read",
+  new: export const HARNESS_TOOL_NAMES = [\n  "file_hash_read_BROKEN",
+  Effect: registration loop registers a phantom name; `tools["file_hash_read"]`
+  is undefined while the tool table still keys the real name → mismatch.
+
+$ bun test > /tmp/opencode/sabotageA.log 2>&1
+EXIT:1
+  151 pass
+  10 fail
+  510 expect() calls
+  Ran 161 tests across 8 files.
+Failing tests (excerpts):
+  (fail) file_hash tools end to end > file_hash_read honors offset and limit windows
+    TypeError: undefined is not an object (evaluating 'host.tools.get("file_hash_read").execute')
+  (fail) file_hash tools end to end > file_hash_edit applies a hunk and the read reflects the replacement
+    TypeError: undefined is not an object (evaluating 'reader.execute')
+  (fail) mcp config and module wiring > buildHarnessTools returns five bound executors
+    TypeError: undefined is not an object (evaluating 'tools[name].execute')
+  (+ 7 further plugin.test.ts failures on tool identity/lookup)
+→ Check correctly FAILS when sabotaged (not vacuous). Full log: /tmp/opencode/sabotageA.log
+
+Restore:
+$ git checkout -- src/index.ts
+$ git status --short
+(clean — no output)
+
+$ bun test > /tmp/opencode/restoreA.log 2>&1
+EXIT:0
+  161 pass
+  0 fail
+  543 expect() calls
+→ Clean restoration confirmed green.
+
+## 2. RED-PROOF B — Break Wave 1 invariant (SPEC §2.3 A computeLineHash)
+
+Condition asserted: `computeLineHash` is the deterministic 4-hex FNV-1a hash
+of the trimmed line (`0000`–`ffff`); distinct lines hash distinctly; anchors
+fail closed beyond the ±25-line window.
+
+Sabotage (minimal):
+  file: src/editors/hashline-tools.ts
+  old: export function computeLineHash(line: string): string {\n  const text = line.trim();
+  new: export function computeLineHash(line: string): string {\n  void line;\n  return "0000";
+  Effect: every line hashes to the constant "0000" — collisions everywhere,
+  drift-window test can no longer distinguish anchors.
+
+$ bun test > /tmp/opencode/sabotageB.log 2>&1
+EXIT:1
+  158 pass
+  3 fail
+  541 expect() calls
+Failing tests:
+  (fail) computeLineHash > empty and whitespace-only lines hash the FNV offset basis low 16 bits
+  (fail) computeLineHash > distinct lines usually hash distinctly
+  (fail) hashEditFile > fails closed when the anchor drifted beyond the 25-line window
+→ Check correctly FAILS when sabotaged (not vacuous). Full log: /tmp/opencode/sabotageB.log
+
+Restore:
+$ git checkout -- src/editors/hashline-tools.ts
+$ git status --short
+(clean — no output; STATUS_DONE)
+
+$ bun test > /tmp/opencode/restoreB.log 2>&1
+EXIT:0
+  161 pass
+  0 fail
+  543 expect() calls
+→ Clean restoration confirmed green.
+
+## 3. Final green re-verification (after all restores)
+
+$ make check            → MAKE_CHECK_EXIT:0 (161 pass / 0 fail)
+$ bash scripts/accept/wave-1.sh → W1_EXIT:0
+$ bash scripts/accept/wave-2.sh → W2_EXIT:0
+$ bash scripts/accept/wave-3.sh → W3_EXIT:0
+$ git status --short    → clean (no output), GITSTATUS_EXIT:0
+$ git diff --stat       → empty (no uncommitted src/test modifications)
+DIFF_DONE
+
+## 4. Handoff gate
+
+- src/ and test/ unmodified: `git status --short` shows NOTHING (verified
+  after each `git checkout --` and in the final check above).
+- Only new/untracked path is this evidence file:
+  docs/evidence/wave-3/red-proofs.log (this log).
+- No commits made by QA (evaluator, not author). No subagents spawned.
+- Zero-stub / scope gates green via the accept scripts (no TODO/skip/empty
+  catch; no WebUI/scheduler/worktree/research code).
+
+VERDICT: QA PASS — all 3 waves green, both red-proofs fail-when-broken and
+restore cleanly.
