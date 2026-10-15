@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // SPEC §2-era name "allowImportingExtensions" is not a real tsc flag;
+    // the correct TypeScript (≥5.7) flag is "allowImportingTsExtensions"
+    // (default false — preserved here explicitly).
+    "allowImportingTsExtensions": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["bun"]
+  },
+  "include": ["src/**/*", "test/**/*"]
+}
