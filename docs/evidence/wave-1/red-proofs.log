@@ -1,0 +1,175 @@
+# Wave 1 Red-Proof Sabotage Log — QA Agent
+Date: 2026-10-15
+Branch: wave-1-editors-guards
+Worktree: /home/john/Projects/Heretek-AI-Rebuild/opencode-harness/worktrees/wave-1
+Spec: docs/prompts/SPEC.md Section 2.3 (A–D)
+
+## 0. Baseline (clean tree, pre-sabotage)
+$ make check
+  $ bun run check  -> tsc --noEmit, exit 0, zero diagnostics
+  $ bun test       -> 62 pass, 0 fail, 217 expect() calls across 4 files, exit 0
+MAKE_CHECK_EXIT:0
+
+$ bash scripts/accept/wave-1.sh
+  ok: bun run check (tsc --noEmit)
+  ok: bun test (editors, guards, circuit-breaker, bootstrap)
+  ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+  ok: export present: computeLineHash
+  ok: export present: hashReadFile
+  ok: export present: hashEditFile
+  ok: export present: astSearch
+  ok: export present: astRewriteFile
+  ok: export present: classifyShellCommand
+  ok: export present: evaluateBoardGuard
+  ok: export present: recordToolAttempt
+  ok: export present: sessionAttempts
+  ok: export present: shouldEscalateModel
+  ok: export present: circuit-breaker-intervention severity
+  ok: scope refusal scan (single-session plugin only)
+  WAVE 1 ACCEPT: ALL GATES GREEN
+ACCEPT_EXIT:0
+
+## 1. Additional QA duties
+### 1a. ZERO STUBS (src/ + test/)
+$ grep -rn --include='*.ts' -E 'TODO' src test -> no hits (clean)
+$ grep -rn --include='*.ts' -E 'test\.skip|describe\.skip|it\.skip' src test -> no hits (clean)
+$ grep -rn --include='*.ts' -E 'catch[[:space:]]*(\([^)]*\))?[[:space:]]*\{\s*\}' src test -> no hits (clean)
+$ grep -rn -F '||' src test --include='*.ts' | grep -F 'true' -> no hits (clean)
+$ grep -rn --include='*.ts' -E 'set \+e' src test -> no hits (clean)
+$ grep -rn --include='*.ts' 'return true' src test -> 9 hits in src/guards/shell-parse.ts ONLY,
+   all legitimate classifier predicates (segmentIsDestructive/segmentIsWrite helpers
+   returning boolean per SPEC Rule 1), NOT vacuous dummy passes. Verified by reading
+   src/guards/shell-parse.ts lines 47-223. No bare `return true;` stubs.
+VERDICT: ZERO STUBS PASS
+
+### 1b. SPEC Section 2.3 exports (all present in src/)
+computeLineHash, hashReadFile, hashEditFile, HASH_SHIFT_WINDOW,
+astSearch, astRewriteFile,
+classifyShellCommand, isDestructiveShellCommand, isFileMutatingShellCommand,
+evaluateBoardGuard, defaultGuardConfig,
+recordToolAttempt, sessionAttempts, shouldEscalateModel,
+circuit-breaker-intervention severity="critical" (src/guards/circuit-breaker.ts:108,113)
+VERDICT: EXPORTS PASS (14/14 + intervention string)
+
+### 1c. Acceptance script exits 0/1 correctly
+Clean tree: bash scripts/accept/wave-1.sh -> exit 0 (WAVE 1 ACCEPT: ALL GATES GREEN)
+Sabotaged tree (Sabotage 1 below): bash scripts/accept/wave-1.sh -> exit 1 (WAVE 1 ACCEPT: GATES FAILED)
+VERDICT: ACCEPT 0/1 PASS (non-vacuous)
+
+## 2. Red-Proof Sabotage 1 — computeLineHash
+Asserted condition: `bun test` must fail when line hashes are wrong; `hashEditFile`
+fail-closed anchor validation depends on `computeLineHash` (FNV-1a 4-hex).
+Sabotage (transient, via native edit tool on src/editors/hashline-tools.ts):
+  OLD:
+    export function computeLineHash(line: string): string {
+      const text = line.trim();
+      let hash = 0x811c9dc5;
+      for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      const narrowed = (hash >>> 0) & 0xffff;
+      return narrowed.toString(16).padStart(4, "0");
+    }
+  NEW:
+    export function computeLineHash(line: string): string {
+      void line;
+      return "0000";
+    }
+$ bun test
+  (fail) computeLineHash > empty and whitespace-only lines hash the FNV offset basis low 16 bits
+    Expected: "9dc5"  Received: "0000"  (test/editors.test.ts:55)
+  (fail) computeLineHash > distinct lines usually hash distinctly
+    Expected: 5  Received: 1  (test/editors.test.ts:63)
+  (fail) hashEditFile > fails closed when the anchor drifted beyond the 25-line window
+    Expected: false  Received: true  (test/editors.test.ts:228)
+  59 pass, 3 fail, 215 expect() calls
+SABOTAGE1_BUNTEST_EXIT:1 (FAIL as required — check is non-vacuous)
+$ bash scripts/accept/wave-1.sh (still sabotaged)
+  FAIL: bun test (editors, guards, circuit-breaker, bootstrap)
+  WAVE 1 ACCEPT: GATES FAILED
+SABOTAGE1_ACCEPT_EXIT:1 (FAIL as required)
+$ git checkout -- src/editors/hashline-tools.ts
+RESTORE1_EXIT:0
+$ git status --short -> (empty, clean)
+$ bun test -> 62 pass, 0 fail, 217 expect() calls
+CLEAN_TEST_EXIT:0 (restoration verified)
+
+## 3. Red-Proof Sabotage 2 — permission-guard QA source lock
+Asserted condition: `bun test` must fail when `qa-adversary` is allowed to edit
+`src/index.ts` (SPEC Section 2.3 C Rule 3: qa-adversary/agency-qa denied edit/write/patch on src/**).
+Sabotage (transient, via native edit tool on src/guards/permission-guard.ts):
+  OLD:
+    if (QA_RED_TEAM_ROLES.has(role) && isEditTool(tool) && path !== undefined) {
+  NEW:
+    if (false && QA_RED_TEAM_ROLES.has(role) && isEditTool(tool) && path !== undefined) {
+  (inner `if (path === "src" ...)` also neutralised to `if (false)` during sabotage;
+   net effect: entire Rule 3 block disabled, so qa-adversary edit on src/index.ts returns allowed:true)
+$ bun test
+  (fail) permission-guard Rule 3 (QA red-team source lock) > denies qa-adversary and agency-qa edits on src/**
+    Expected: false  Received: true  (test/guards.test.ts:131, role=qa-adversary path=src/index.ts)
+  (fail) permission-guard Rule 3 (QA red-team source lock) > denies QA edits outside the writable allow-list
+    Expected: false  Received: true  (test/guards.test.ts:153, path=package.json)
+  60 pass, 2 fail, 211 expect() calls
+SABOTAGE2_BUNTEST_EXIT:1 (FAIL as required — check is non-vacuous)
+$ git checkout -- src/guards/permission-guard.ts
+RESTORE2_EXIT:0
+$ git status --short -> (empty, clean)
+$ bun test -> 62 pass, 0 fail, 217 expect() calls
+CLEAN_TEST2_EXIT:0 (restoration verified)
+
+## 4. Clean handoff gate
+$ git status --short -> only untracked docs/evidence/wave-1/red-proofs.log (this file);
+   no uncommitted src/, test/, scripts/ modifications.
+$ git diff --stat -> clean (no tracked modifications)
+VERDICT: HANDOFF CLEAN (src/ restored bit-for-bit via git checkout --)
+
+## 5. Summary
+- make check: exit 0
+- bash scripts/accept/wave-1.sh (clean): exit 0
+- Sabotage 1 (computeLineHash -> "0000"): bun test exit 1 (3 fails), accept exit 1, restore exit 0, clean re-test exit 0
+- Sabotage 2 (Rule 3 disabled -> qa-adversary allowed on src/index.ts): bun test exit 1 (2 fails), restore exit 0, clean re-test exit 0
+- Zero stubs: PASS (return-true hits are legitimate classifier predicates)
+- SPEC 2.3 exports: PASS (14/14)
+- Accept 0/1: PASS
+- git status: clean (only this evidence log untracked pre-commit)
+
+## 6. QA Agent independent re-verification (2026-10-15, branch wave-1-editors-guards)
+Baseline (clean tree):
+$ make check -> bun run check exit 0; bun test 62 pass, 0 fail, 217 expect() calls, exit 0
+MAKE_CHECK_EXIT:0
+$ bash scripts/accept/wave-1.sh -> WAVE 1 ACCEPT: ALL GATES GREEN
+ACCEPT_EXIT:0
+$ zero-stub grep scan -> clean (no TODO/skip/empty-catch/set +e hits in src, test)
+$ export grep scan -> computeLineHash, hashReadFile, hashEditFile, astSearch,
+  astRewriteFile, classifyShellCommand, evaluateBoardGuard, recordToolAttempt,
+  sessionAttempts, shouldEscalateModel all present
+VERDICT: ZERO-STUBS + EXPORTS PASS (matches Sections 1a/1b above)
+
+Sabotage 1 re-run (computeLineHash):
+$ native edit src/editors/hashline-tools.ts: replaced function head with `return "0000";`
+  (remainder of FNV-1a body left unreachable; compiles, hashes constant)
+$ bun test -> 59 pass, 3 fail, 215 expect() calls
+SABOTAGE1_BUNTEST_EXIT:1 (FAIL as required — non-vacuous)
+$ git checkout -- src/editors/hashline-tools.ts
+RESTORE1_EXIT:0
+$ git status --short -> empty; bun test -> 62 pass, 0 fail, 217 expect() calls
+CLEAN_TEST_EXIT:0
+
+Sabotage 2 re-run (permission-guard Rule 3):
+$ native edit src/guards/permission-guard.ts:
+  `if (QA_RED_TEAM_ROLES.has(role) ...)` -> `if (false && QA_RED_TEAM_ROLES.has(role) ...)`
+  (entire Rule 3 block disabled; qa-adversary edit on src/index.ts returns allowed:true)
+$ bun test -> 60 pass, 2 fail, 211 expect() calls
+  (fail) Rule 3 denies qa-adversary/agency-qa edits on src/** (test/guards.test.ts)
+  (fail) Rule 3 denies QA edits outside the writable allow-list (test/guards.test.ts:153)
+SABOTAGE2_BUNTEST_EXIT:1 (FAIL as required — non-vacuous)
+$ git checkout -- src/guards/permission-guard.ts
+RESTORE2_EXIT:0
+$ git status --short -> empty (only this evidence log modified); bun test -> 62 pass, 0 fail
+CLEAN_TEST2_EXIT:0
+
+Final: $ make check exit 0; $ bash scripts/accept/wave-1.sh exit 0 (post-restore)
+HANDOFF: src/ + test/ + scripts/ unmodified (git checkout -- restored bit-for-bit);
+only docs/evidence/wave-1/red-proofs.log committed as evidence.
+QA-VERDICT: WAVE 1 GATES GREEN, RED-PROOFS REPRODUCED (1/1, 1/1)
