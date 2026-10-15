@@ -1,0 +1,58 @@
+# Wave 2 Red-Proof Sabotage Log — QA Agent (agency-qa)
+Date: 2026-10-15
+Branch: wave-2-context-dom
+Worktree: /home/john/Projects/Heretek-AI-Rebuild/opencode-harness/worktrees/wave-2
+Target: src/context/context-budget.ts vs test/context-budget.test.ts
+
+## Baseline (clean, pre-sabotage)
+- `make check` → exit 0 (tsc --noEmit 0 diagnostics; bun test 100 pass / 0 fail / 301 expects across 7 files)
+- `bash scripts/accept/wave-2.sh` → exit 0 (WAVE 2 ACCEPT: ALL GATES GREEN)
+- `bash scripts/accept/wave-1.sh` (regression) → exit 0 (WAVE 1 ACCEPT: ALL GATES GREEN; 62 pass / 0 fail on wave-1 subset)
+
+## Sabotage A — mutate event.system (KV-cache invariant violation)
+1. Condition asserted: `injectContextBudgetIntoMessages` MUST NEVER mutate `event.system`
+   (test: "leaves event.system bit-for-bit identical" + throw-path system check).
+2. Sabotage (via edit tool, minimal 1-line insertion after the empty-packedText early return):
+   ```
+   (event as unknown as { system?: Array<{ text: string }> }).system?.push({ text: "sabotage-mutates-system" });
+   ```
+   Full context: inserted between `if (packedText === "") { return; }` and
+   `if (!Array.isArray(event.messages) || event.messages.length === 0) {`.
+3. Run: `bun test test/context-budget.test.ts` → exit 1 (FAIL, as required)
+   - 21 pass, 2 fail, 54 expect() calls
+   - Fail 1: `injectContextBudgetIntoMessages > leaves event.system bit-for-bit identical`
+     Expected: `[{"text":"system prompt v1"},{"text":"second block"}]`
+     Received: `[...,{"text":"sabotage-mutates-system"}]`
+   - Fail 2: `injectContextBudgetIntoMessages > fails closed without mutating system when no user message exists`
+     Expected: `[{"text":"sys"}]`
+     Received: `[{"text":"sys"},{"text":"sabotage-mutates-system"}]`
+   - Verdict: check is NOT vacuous — it catches system mutation. SABOTAGE_A_EXIT=1
+4. Revert: `git checkout -- src/context/context-budget.ts` → exit 0 (RESTORE_A_EXIT=0)
+5. `git status --short` after restore → clean (no output).
+
+## Sabotage B — float relevance="0.87" in episodic memory tag (zero-float invariant violation)
+1. Condition asserted: episodic tags carry ONLY `id`, ZERO float relevance scores/timestamps
+   (tests: "sorts lessons by id and formats the exact episodic tag shape" + "episodic tags carry zero float scores or timestamps").
+2. Sabotage (via edit tool, 1-line change in `formatEpisodicLesson` return):
+   - Before: `` return `<episodic-repository-memory id="${id}">\n- (${lesson.trigger}): ${lesson.lesson}\n</episodic-repository-memory>`; ``
+   - After:  `` return `<episodic-repository-memory id="${id}" relevance="0.87">\n- (${lesson.trigger}): ${lesson.lesson}\n</episodic-repository-memory>`; ``
+3. Run: `bun test test/context-budget.test.ts` → exit 1 (FAIL, as required)
+   - 21 pass, 2 fail, 53 expect() calls
+   - Fail 1: `buildDynamicContextBlocks > sorts lessons by id and formats the exact episodic tag shape`
+     id-regex `/<episodic-repository-memory id="([^"]+)">/` matched [] instead of ["m-1","m-10","m-2"]
+   - Fail 2: `buildDynamicContextBlocks > episodic tags carry zero float scores or timestamps`
+     Expected: `<episodic-repository-memory id="lesson-a">`
+     Received: `<episodic-repository-memory id="lesson-a" relevance="0.87">`
+   - Verdict: check is NOT vacuous — it catches float attributes. SABOTAGE_B_EXIT=1
+4. Revert: `git checkout -- src/context/context-budget.ts` → exit 0 (RESTORE_B_EXIT=0)
+5. `git status --short` after restore → clean (no output).
+
+## Restoration (clean, post-sabotage)
+- `make check` → exit 0 (100 pass / 0 fail / 301 expects) [GREEN_CHECK_EXIT=0]
+- `bash scripts/accept/wave-2.sh` → exit 0 (WAVE 2 ACCEPT: ALL GATES GREEN) [GREEN_W2_EXIT=0]
+- `git status --short` → clean except untracked `docs/evidence/wave-2/` log (all src/test restored).
+  Verified: `git status --short` printed empty before evidence-log creation (STATUS_EXIT=0).
+
+## QA Conclusion
+Both red-proofs FAIL when sabotaged (exit 1) and PASS when clean (exit 0).
+No vacuous passes. Source restored bit-for-bit via `git checkout --`.
