@@ -6,6 +6,9 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import type { ZodTypeAny } from "zod";
+import { HARNESS_RELEASE_VERSION } from "../version.js";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import type { GuardRequest, GuardVerdict } from "../guards/permission-guard.js";
 import type { SessionEvent, SessionMessage } from "../context/context-budget.js";
 import {
@@ -190,6 +193,8 @@ export interface OpenCodeV2McpEditor {
 }
 
 export interface OpenCodeV2PromiseContext {
+  /** Plugin options from the `plugins` config entry (OpenCode V2 `PluginOptions`). */
+  options?: Readonly<Record<string, unknown>>;
   directory?: string;
   worktree?: string;
   location?: { directory?: string; worktree?: string };
@@ -279,6 +284,24 @@ const CODEMODE_PINNED_TOOLS = new Set([
   "architecture_audit",
 ]);
 
+/**
+ * Convert a harness zod (v3) argument schema into a plain JSON Schema object
+ * for `ToolEditor.add({ input })`. The real OpenCode V2 host
+ * (`packages/core/src/tool/runtime.ts`) only accepts Effect schemas, Standard
+ * JSON Schema implementations, or plain JSON Schema; zod v3 schemas are
+ * rejected at registration ("Schema vendor zod does not support JSON Schema
+ * conversion") and the tool silently disappears. Arguments are still
+ * validated by the zod schema inside each tool's `execute`.
+ */
+export function toHostInputSchema(schema: ZodTypeAny): Record<string, unknown> {
+  const json = zodToJsonSchema(schema, {
+    target: "jsonSchema7",
+    $refStrategy: "none",
+  }) as Record<string, unknown>;
+  const { $schema: _ignored, ...rest } = json;
+  return rest;
+}
+
 export function inspectHostContract(
   ctx: OpenCodeV2PromiseContext,
   pluginId: string,
@@ -356,6 +379,12 @@ export function wireOpenCodeV2PromiseContext(params: {
     error?: string;
   }) => { tripped: boolean; directive?: string };
   runContextBudget: (ev: SessionEvent) => void;
+  /**
+   * Opt-in: add the recommended `lsp-mcp-server` / `fallow-mcp` servers when
+   * absent. Off by default because both launch through `bunx` / `npx --yes`,
+   * which download and run npm packages the user never configured.
+   */
+  seedRecommendedMcp?: boolean;
 }): DoctorReport {
   const {
     ctx,
@@ -364,6 +393,7 @@ export function wireOpenCodeV2PromiseContext(params: {
     evaluatePermission,
     recordCircuitBreaker,
     runContextBudget,
+    seedRecommendedMcp = false,
   } = params;
 
   const toolNames = Object.keys(tools);
@@ -382,7 +412,7 @@ export function wireOpenCodeV2PromiseContext(params: {
         editor.add({
           name,
           description: def.description,
-          input: def.parameters,
+          input: toHostInputSchema(def.parameters),
           options: { codemode: false },
           execute: async (args, execCtx) => {
             const raw = await def.execute(args, execCtx as any);
@@ -402,7 +432,7 @@ export function wireOpenCodeV2PromiseContext(params: {
           editor.add({
             name,
             description: def.description,
-            input: def.parameters,
+            input: toHostInputSchema(def.parameters),
             options: {
               namespace: "harness",
               codemode: true,
@@ -429,15 +459,20 @@ export function wireOpenCodeV2PromiseContext(params: {
     });
   }
 
-  // 3. Seed recommended MCP servers (`lsp-mcp-server`, `fallow-mcp`) if not already configured
-  if (typeof ctx.mcp?.transform === "function") {
+  // 3. Opt-in: seed recommended MCP servers (`lsp-mcp-server`, `fallow-mcp`)
+  //    in the OpenCode V2 `Mcp.LocalConfig` shape when not already configured.
+  if (seedRecommendedMcp && typeof ctx.mcp?.transform === "function") {
     ctx.mcp.transform((editor) => {
       const rec = getRecommendedMcpConfig().mcpServers;
       for (const [serverName, cfg] of Object.entries(rec)) {
         const existing =
           typeof editor.get === "function" ? editor.get(serverName) : undefined;
         if (!existing) {
-          editor.set(serverName, cfg);
+          editor.set(serverName, {
+            type: "local",
+            command: [cfg.command, ...cfg.args],
+            ...(cfg.env !== undefined ? { environment: cfg.env } : {}),
+          });
         }
       }
     });
@@ -454,7 +489,7 @@ export function wireOpenCodeV2PromiseContext(params: {
           const rep = inspectHostContract(
             ctx,
             "@heretek-ai/opencode-harness",
-            "1.0.6",
+            HARNESS_RELEASE_VERSION,
             workspaceRoot,
             toolNames,
           );
@@ -908,7 +943,7 @@ export function wireOpenCodeV2PromiseContext(params: {
   return inspectHostContract(
     ctx,
     "@heretek-ai/opencode-harness",
-    "1.0.6",
+    HARNESS_RELEASE_VERSION,
     workspaceRoot,
     toolNames,
   );

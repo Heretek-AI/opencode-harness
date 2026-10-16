@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import OpenCodeV2Plugin, {
+  setupOpenCodeV2Harness,
   analyzeBlastRadius,
   assertTaskInvariants,
   auditDiffCoverageAndTautology,
@@ -390,7 +391,7 @@ describe("ported SwarmOS module 6: episodic memory, Muse 1.3 calibration & OpenC
       },
     };
 
-    const doctor = OpenCodeV2Plugin.setup(fakePromiseCtx);
+    const doctor = setupOpenCodeV2Harness(fakePromiseCtx).report;
     expect(doctor.healthy).toBe(true);
     expect(addedTools.sort()).toEqual([...EXTENDED_HARNESS_TOOL_NAMES].sort());
 

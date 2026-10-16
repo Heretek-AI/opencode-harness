@@ -32,6 +32,28 @@ import { buildMuseSystemOverlay } from "../muse/muse-calibration.js";
 const META_SUBAGENT_OVERTRIGGER =
   "- Use the `subagent` tool to minimize context token usage whenever tool calls generate large outputs but only a small subset is useful for the task at hand. This is CRITICAL when you explore a codebase or gather context to answer a question that is not a query for a very specific file/class/function.";
 
+/**
+ * Fallback matcher for the same `meta.txt` bullet if upstream rewords it: any
+ * single bullet line telling the model to use `subagent` to save context
+ * tokens. Deliberately one line (`[^\n]*`) so nothing else is touched.
+ */
+/**
+ * Fallback for a reworded upstream sentence: the bullet line that mentions both
+ * the `subagent` tool and context token usage. A plain line scan (no regex) keeps
+ * this linear on arbitrary prompt text.
+ */
+function replaceSubagentOvertriggerLine(text: string): string | undefined {
+  const lines = text.split("\n");
+  const index = lines.findIndex((line) => {
+    if (!line.startsWith("- ")) return false;
+    const toolAt = line.indexOf("`subagent` tool");
+    return toolAt !== -1 && line.indexOf("context token usage", toolAt) !== -1;
+  });
+  if (index === -1) return undefined;
+  lines[index] = CALIBRATED_SUBAGENT_RULE;
+  return lines.join("\n");
+}
+
 const CALIBRATED_SUBAGENT_RULE =
   "- Perform routine file reads (`read`, `file_hash_read`, `file_outline`), targeted searches (`grep`, `glob`, `ast_structural_search`, `symbol_references`), and dependency checks (`repo_map`, `blast_radius`) directly in the main context. Only spawn a `subagent` when broad exploration spans more than 8 files or when executing independent parallel workstreams.";
 
@@ -56,6 +78,14 @@ export function calibrateSystemPromptInPlace(
     if (text.includes(META_SUBAGENT_OVERTRIGGER)) {
       text = text.replace(META_SUBAGENT_OVERTRIGGER, CALIBRATED_SUBAGENT_RULE);
       modified = true;
+    } else {
+      // Upstream reworded the sentence: still replace the whole bullet line so
+      // the calibration does not silently become a no-op.
+      const replaced = replaceSubagentOvertriggerLine(text);
+      if (replaced !== undefined) {
+        text = replaced;
+        modified = true;
+      }
     }
     const overlay = buildMuseSystemOverlay();
     if (!text.includes("<muse-1.3-harness-calibration>")) {

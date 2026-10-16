@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import OpenCodeV2Plugin, {
+  setupOpenCodeV2Harness,
   applyRootAffinityHeadersInPlace,
   buildEditNearMissContext,
   calibrateSystemPromptInPlace,
@@ -386,9 +387,22 @@ describe("systems engineering & architecture advisor: circular dependency & cont
       },
     };
 
-    const doctor = OpenCodeV2Plugin.setup(ctx);
+    // MCP seeding is opt-in: a default setup must not add servers that run
+    // `bunx` / `npx --yes` on the user's machine.
+    const unseeded = new Map<string, unknown>();
+    setupOpenCodeV2Harness({
+      ...ctx,
+      mcp: { transform: (fn) => fn({ get: (n) => unseeded.get(n), set: (n, c) => unseeded.set(n, c) }) },
+    });
+    expect(unseeded.size).toBe(0);
+    slashCommands.length = 0;
+
+    const doctor = setupOpenCodeV2Harness({ ...ctx, options: { seedRecommendedMcp: true } }).report;
     expect(doctor.healthy).toBe(true);
-    expect(mcpServers.has("lsp-mcp-server")).toBe(true);
+    expect(mcpServers.get("lsp-mcp-server")).toEqual({
+      type: "local",
+      command: ["bunx", "lsp-mcp-server"],
+    });
     expect(slashCommands.sort()).toEqual(["audit", "doctor"]);
 
     // Verify explore agent is blocked from running file-mutating shell commands

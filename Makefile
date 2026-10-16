@@ -1,4 +1,4 @@
-.PHONY: check test accept
+.PHONY: check test accept host-test
 
 check:
 	bun run check
@@ -19,3 +19,7 @@ accept:
 	else \
 		bash scripts/accept/wave-$(WAVE).sh; \
 	fi
+
+# Load the plugin into a real OpenCode V2 host (clones anomalyco/opencode at a pinned commit).
+host-test:
+	bash scripts/host-test/run.sh
