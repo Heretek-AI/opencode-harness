@@ -32,50 +32,50 @@ import {
   astRewriteFile,
   astSearch,
   type AstLanguage,
-} from "./editors/ast-codemod";
+} from "./editors/ast-codemod.js";
 import {
   hashEditFile,
   hashReadFile,
   type HashEditHunk,
-} from "./editors/hashline-tools";
+} from "./editors/hashline-tools.js";
 import {
   defaultGuardConfig,
   evaluateBoardGuard,
   type GuardPolicyConfig,
   type GuardRequest,
   type GuardVerdict,
-} from "./guards/permission-guard";
+} from "./guards/permission-guard.js";
 import {
   commandPrefixOf,
   recordToolAttempt,
   type CircuitBreakerVerdict,
-} from "./guards/circuit-breaker";
+} from "./guards/circuit-breaker.js";
 import {
   buildDynamicContextBlocks,
   injectContextBudgetIntoMessages,
   packBlocks,
   type LessonInput,
   type SessionEvent,
-} from "./context/context-budget";
+} from "./context/context-budget.js";
 import {
   auditLivePageWithPlaywright,
   evaluateDomGeometryInPage,
   type DomElementInput,
   type ViewportInput,
-} from "./ui-auditor/dom-auditor";
+} from "./ui-auditor/dom-auditor.js";
 
-export * from "./editors/hashline-tools";
-export * from "./editors/ast-codemod";
-export * from "./guards/shell-parse";
-export * from "./guards/permission-guard";
-export * from "./guards/circuit-breaker";
-export * from "./context/context-budget";
-export * from "./ui-auditor/dom-auditor";
-export { getRecommendedMcpConfig } from "./ui-auditor/mcp-defaults";
+export * from "./editors/hashline-tools.js";
+export * from "./editors/ast-codemod.js";
+export * from "./guards/shell-parse.js";
+export * from "./guards/permission-guard.js";
+export * from "./guards/circuit-breaker.js";
+export * from "./context/context-budget.js";
+export * from "./ui-auditor/dom-auditor.js";
+export { getRecommendedMcpConfig } from "./ui-auditor/mcp-defaults.js";
 export type {
   McpServerEntry,
   RecommendedMcpConfig,
-} from "./ui-auditor/mcp-defaults";
+} from "./ui-auditor/mcp-defaults.js";
 
 export const HARNESS_NAME = "@heretek-ai/opencode-harness";
 export const HARNESS_VERSION = "1.0.0";

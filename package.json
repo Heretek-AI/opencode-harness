@@ -2,14 +2,57 @@
   "name": "@heretek-ai/opencode-harness",
   "version": "1.0.0",
   "description": "Lean OpenCode v2 in-process harness plugin: Hashline edits, AST codemods, KV-cache-safe context budgeting, permission guards, and DOM geometry auditing.",
-  "type": "module",
-  "main": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Heretek-AI/opencode-harness.git"
   },
+  "homepage": "https://github.com/Heretek-AI/opencode-harness",
+  "bugs": {
+    "url": "https://github.com/Heretek-AI/opencode-harness/issues"
+  },
+  "author": "Heretek-AI",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "hashline",
+    "ast-codemod",
+    "permission-guard",
+    "circuit-breaker",
+    "context-budget",
+    "dom-audit"
+  ],
+  "engines": {
+    "bun": ">=1.0.0",
+    "node": ">=22.0.0"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md"
+  ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run check && bun test && npm run build",
     "accept": "bash scripts/accept/run.sh"
   },
   "dependencies": {

@@ -1,0 +1,14 @@
+# Defense-in-depth: `files` in package.json is the primary allowlist.
+# This file excludes junk from the published tarball even if the
+# allowlist is ever loosened.
+test/
+docs/reports/
+docs/evidence/
+scripts/accept/
+worktrees/
+.github/
+*.log
+bun.lock
+coverage/
+.nyc_output/
+*.tsbuildinfo

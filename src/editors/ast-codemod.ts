@@ -14,7 +14,7 @@
  */
 
 import { createRequire } from "node:module";
-import { resolveSafePath } from "./hashline-tools";
+import { resolveSafePath } from "./hashline-tools.js";
 
 export type AstLanguage =
   | "typescript"

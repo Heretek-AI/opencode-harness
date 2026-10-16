@@ -25,7 +25,7 @@
 import {
   classifyShellCommand,
   isDestructiveShellCommand,
-} from "./shell-parse";
+} from "./shell-parse.js";
 
 export const DEFAULT_LOCKED_CONTRACT_GLOBS: string[] = [
   "**/contracts/**",
