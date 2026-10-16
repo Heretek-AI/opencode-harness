@@ -1,0 +1,110 @@
+# Wave 6 QA Red-Proof Sabotage Log — agency-qa
+# Worktree: worktrees/wave-6 | Branch: wave-6-v105 (efabedf) | Date: 2026-10-16
+# Spec: docs/reports/wave-6.md (v1.0.5) + AGENTS.md + docs/prompts/SPEC.md + MASTER_BUILD_PROMPT.md
+# Baseline expectation: 189 pass, 0 fail across 11 test files (183 prior + 6 in test/wave6-engineering.test.ts)
+
+## BASELINE (clean tree, no sabotage)
+$ make check
+  $ bun run check        # tsc --noEmit -> EXIT 0
+  $ bun test             # 189 pass, 0 fail, 709 expect() calls, 11 files -> EXIT 0
+  => make check EXIT: 0
+$ bash scripts/accept/wave-6.sh
+  ok: bun run check (tsc --noEmit)
+  ok: bun test (full suite incl. wave6-engineering)   # 189 pass
+  ok: bun test test/wave6-engineering.test.ts (6 wave6 tests)  # 6 pass
+  ok: wave-1 regression
+  ok: wave-2 regression
+  ok: wave-3 regression
+  ok: wave-4 regression
+  ok: wave-5 regression
+  ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+  ok: export present: resolveRelativeModuleFile / parseRelativeImportStatements / collectExportedSymbolNames / verifyModuleImportsAndExports / findSymbolReferences / formatSymbolReferencesBlock / symbol_references / repairPatchToolInputInPlace / compactToolOutputHeadTail
+  ok: wired into index: diagnostics/import-verifier.js
+  ok: wired into diagnostics-runner: verifyModuleImportsAndExports
+  ok: all relative imports in src/ use .js extensions
+  ok: scope refusal scan (single-session plugin only)
+  WAVE 6 ACCEPT: ALL GATES GREEN -> EXIT 0
+$ for w in 1 2 3 4 5; do bash scripts/accept/wave-$w.sh; done
+  wave-1 exit:0 WAVE 1 ACCEPT: ALL GATES GREEN
+  wave-2 exit:0 WAVE 2 ACCEPT: ALL GATES GREEN
+  wave-3 exit:0 WAVE 3 ACCEPT: ALL GATES GREEN
+  wave-4 exit:0 WAVE 4 ACCEPT: ALL GATES GREEN
+  wave-5 exit:0 WAVE 5 ACCEPT: ALL GATES GREEN
+
+## RED-PROOF 1 (NEW Wave 6): cross-file import/export contract verifier
+1. Condition asserted: verifyModuleImportsAndExports() in src/diagnostics/import-verifier.ts
+   must emit `import-resolver` + `export-contract` FileDiagnostics for broken relative
+   paths and hallucinated named exports; asserted by test/wave6-engineering.test.ts
+   (capabilities 1 + 5) and scripts/accept/wave-6.sh Gates 2/3.
+2. Sabotage (minimal, via native edit tool): src/diagnostics/import-verifier.ts
+     export function verifyModuleImportsAndExports(
+       absPath: string,
+       rawContent?: string,
+   -  ): FileDiagnostic[] {
+   -    const ext = extname(absPath).toLowerCase();
+   +  ): FileDiagnostic[] {
+   +    return [];
+   +    const ext = extname(absPath).toLowerCase();
+   (unconditional early `return [];` — verifier blind to all broken imports)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/wave6-engineering.test.ts
+     (fail) Wave 6 capability 5 ... expect(combined).toContain("export-contract") / Received: "Created file src/caller.ts"
+     3 pass, 3 fail, 33 expect() calls -> EXIT 1 (SABOTAGE1_EXIT:1)
+   $ bash scripts/accept/wave-6.sh
+     WAVE 6 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE1_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/diagnostics/import-verifier.ts -> REVERT1_OK
+5. Clean: $ git status --short -> (empty, no output) STATUS_EXIT:0
+6. Restoration run:
+   $ bun test test/wave6-engineering.test.ts -> 6 pass, 0 fail, 44 expect() calls -> EXIT 0 (RESTORE1_EXIT:0)
+
+## RED-PROOF 2 (NEW Wave 6): lexer-aware symbol_references locator
+1. Condition asserted: findSymbolReferences() in src/repomap/repomap.ts must strip
+   comments/string literals, match whole-word occurrences, classify
+   definition/import/export/reference, and attach 4-hex FNV-1a lineHash anchors;
+   asserted by test/wave6-engineering.test.ts capability 2 (expects 1 definition in
+   auth.ts:2 + 2 references in router.ts) and wave-6.sh Gate 6 (`symbol_references`).
+2. Sabotage (minimal, via native edit tool): src/repomap/repomap.ts
+   -    const trimmed = symbol.trim();
+   -    if (!trimmed) {
+   +    const trimmed = symbol.trim();
+   +    return { symbol: trimmed, totalMatches: 0, definitions: [], references: [], formattedBlock: "" };
+   +    if (!trimmed) {
+   (locator blind — always reports zero matches)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/wave6-engineering.test.ts
+     (fail) Wave 6 capability 2 ... Expected: 1 / Received: 0 (test/wave6-engineering.test.ts:126)
+     5 pass, 1 fail, 37 expect() calls -> EXIT 1 (SABOTAGE2_EXIT:1)
+4. Revert: $ git checkout -- src/repomap/repomap.ts -> REVERT2_OK
+5. Clean: $ git status --short -> (empty, no output) STATUS_EXIT:0
+6. Restoration run:
+   $ bun test test/wave6-engineering.test.ts -> 6 pass, 0 fail, 44 expect() calls -> EXIT 0 (RESTORE2_EXIT:0)
+
+## RED-PROOF 3 (PRIOR invariant, Wave 1): 4-hex FNV-1a computeLineHash + fail-closed hash anchors
+1. Condition asserted: computeLineHash() in src/editors/hashline-tools.ts must be the
+   deterministic 4-hex FNV-1a of trimmed content (incl. computeLineHash("") === "9dc5")
+   and hashEditFile must fail closed on anchor mismatch with +/-25-line recovery;
+   asserted by test/editors.test.ts (26 tests) and scripts/accept/wave-1.sh.
+2. Sabotage (minimal, via native edit tool): src/editors/hashline-tools.ts
+   -    const narrowed = (hash >>> 0) & 0xffff;
+   -    return narrowed.toString(16).padStart(4, "0");
+   +    const narrowed = (hash >>> 0) & 0xffff;
+   +    return "0000";
+   (constant hash collapses all anchors — shifted-anchor + fail-closed logic blinded)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/editors.test.ts
+     (fail) hashEditFile > fails closed when the anchor drifted beyond the 25-line window
+       (test/editors.test.ts:228) Expected: false / Received: true (+ 2 further fails)
+     23 pass, 3 fail, 63 expect() calls -> EXIT 1 (SABOTAGE3_EXIT:1)
+   $ bash scripts/accept/wave-1.sh
+     WAVE 1 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE3_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/editors/hashline-tools.ts -> REVERT3_OK
+5. Clean: $ git status --short -> (empty, no output) STATUS_EXIT:0
+6. Restoration run:
+   $ bun test test/editors.test.ts -> 26 pass, 0 fail, 65 expect() calls -> EXIT 0 (RESTORE3_EXIT:0)
+
+## FINAL RESTORATION (all sabotages reverted)
+$ make check -> 189 pass, 0 fail, 709 expect() calls, 11 files -> FINAL_CHECK_EXIT:0
+$ bash scripts/accept/wave-6.sh -> WAVE 6 ACCEPT: ALL GATES GREEN -> FINAL_W6_EXIT:0
+$ git status --short -> (empty — no uncommitted src/test modifications) FINAL_STATUS_DONE
+# Only new untracked evidence file is docs/evidence/wave-6/red-proofs.log (this file), staged via `git add` (no commit per QA contract).
+# QA changed NO production code. All sabotage edits reverted via `git checkout -- <file>`.
