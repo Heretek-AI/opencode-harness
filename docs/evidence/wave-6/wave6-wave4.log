@@ -1,0 +1,70 @@
+ok: bun run check (tsc --noEmit)
+ok: bun test (full suite incl. ported-harness)
+ok: bun test test/ported-harness.test.ts (12 ported tests)
+ok: wave-1 regression
+ok: wave-2 regression
+ok: wave-3 regression
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: selectRelevantLessons
+ok: export present: proposeEpisodicLesson
+ok: export present: evaluateTaintGuard
+ok: export present: recordUntrustedContentTaint
+ok: export present: isUntrustedIngestionTool
+ok: export present: collectFileDiagnostics
+ok: export present: localizeFaultContext
+ok: export present: formatDiagnosticsTag
+ok: export present: beginEditTransaction
+ok: export present: finalizeEditTransaction
+ok: export present: createCheckpoint
+ok: export present: rollbackCheckpoint
+ok: export present: checkStaleFileRead
+ok: export present: buildRepoMap
+ok: export present: analyzeBlastRadius
+ok: export present: moveModuleAndRewriteImports
+ok: export present: extractOutline
+ok: export present: runIncrementalVerification
+ok: export present: auditDiffCoverageAndTautology
+ok: export present: assertTaskInvariants
+ok: export present: buildMuseSystemOverlay
+ok: export present: sanitizeCompactionPseudoTranscript
+ok: export present: captureWorkspaceDigests
+ok: export present: createMutationReceipt
+ok: export present: wireOpenCodeV2PromiseContext
+ok: export present: inspectHostContract
+ok: export present: buildExtendedHarnessTools
+ok: export present: parseCommandSegments
+ok: export present: splitShellPipeline
+ok: export present: tokenizeSegment
+ok: export present: OpenCodeV2Plugin
+ok: wired into index: context/episodic-memory
+ok: wired into index: guards/taint-guard
+ok: wired into index: diagnostics/diagnostics-runner
+ok: wired into index: transactions/edit-transaction
+ok: wired into index: repomap/repomap
+ok: wired into index: verify/verifier
+ok: wired into index: muse/muse-calibration
+ok: wired into index: host/contract-adapter
+ok: core surface preserved: HARNESS_TOOL_NAMES
+ok: core surface preserved: file_hash_read
+ok: core surface preserved: file_hash_edit
+ok: core surface preserved: ast_structural_search
+ok: core surface preserved: ast_structural_rewrite
+ok: core surface preserved: ui_geometry_audit
+ok: core surface preserved: permission.hook
+ok: core surface preserved: tool.execute.after
+ok: core surface preserved: session.hook
+ok: core surface preserved: getRecommendedMcpConfig
+ok: core surface preserved: lsp-mcp-server
+ok: core surface preserved: fallow-mcp
+mcp config exact: lsp-mcp-server + fallow-mcp
+ok: getRecommendedMcpConfig exact shape (bunx + npx fallow)
+ok: extended surface present: EXTENDED_HARNESS_TOOL_NAMES
+ok: extended surface present: repo_map
+ok: extended surface present: blast_radius
+ok: extended surface present: file_outline
+ok: extended surface present: verify_scoped
+ok: extended surface present: checkpoint_create
+ok: extended surface present: checkpoint_rollback
+ok: scope refusal scan (single-session plugin only)
+ok: scope refusal scan (wave-4.sh clean)
+WAVE 4 ACCEPT: ALL GATES GREEN

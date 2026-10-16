@@ -1,0 +1,27 @@
+ok: bun run check (tsc --noEmit)
+ok: bun test (full suite incl. context-budget, dom-auditor, mcp-defaults)
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: estimateTokens
+ok: export present: packBlocks
+ok: export present: buildDynamicContextBlocks
+ok: export present: injectContextBudgetIntoMessages
+ok: export present: opencode-harness-context
+ok: export present: episodic-repository-memory
+ok: export present: evaluateDomGeometryInPage
+ok: export present: auditLivePageWithPlaywright
+ok: export present: element-overflow-x
+ok: export present: tiny-interactive-target
+ok: export present: descender-clip-risk
+ok: export present: sibling-collision
+ok: export present: row-baseline-jitter
+ok: export present: getRecommendedMcpConfig
+ok: export present: lsp-mcp-server
+ok: export present: fallow-mcp
+ok: export present: wcag2a
+ok: export present: wcag2aa
+ok: export present: wcag22aa
+ok: invariant covered: event.system
+ok: invariant covered: role === "user"
+ok: invariant covered: localeCompare
+ok: scope refusal scan (single-session plugin only)
+WAVE 2 ACCEPT: ALL GATES GREEN

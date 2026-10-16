@@ -1,0 +1,42 @@
+ok: bun run check (tsc --noEmit)
+ok: bun test (full suite incl. plugin entrypoint)
+ok: wave-1 regression (editors + guards)
+ok: wave-2 regression (context budget + DOM auditor)
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: activate
+ok: export present: createHarnessPlugin
+ok: export present: getRecommendedMcpConfig
+ok: export present: file_hash_read
+ok: export present: file_hash_edit
+ok: export present: ast_structural_search
+ok: export present: ast_structural_rewrite
+ok: export present: ui_geometry_audit
+ok: export present: permission.hook
+ok: export present: tool.execute.after
+ok: export present: session.hook
+ok: export present: evaluateBoardGuard
+ok: export present: recordAndEvaluateCircuitBreaker
+ok: export present: registerContextBudgetHook
+ok: export present: injectContextBudgetIntoMessages
+ok: export present: packBlocks
+ok: export present: buildDynamicContextBlocks
+ok: export present: resolveHarnessOptions
+ok: export present: buildHarnessTools
+ok: wired into index: editors/hashline-tools
+ok: wired into index: editors/ast-codemod
+ok: wired into index: guards/shell-parse
+ok: wired into index: guards/permission-guard
+ok: wired into index: guards/circuit-breaker
+ok: wired into index: context/context-budget
+ok: wired into index: ui-auditor/dom-auditor
+ok: wired into index: ui-auditor/mcp-defaults
+ok: test/plugin.test.ts present
+ok: plugin test covers: activate
+ok: plugin test covers: createHarnessPlugin
+ok: plugin test covers: getRecommendedMcpConfig
+ok: plugin test covers: recordAndEvaluateCircuitBreaker
+ok: plugin test covers: registerContextBudgetHook
+mcp config exact: lsp-mcp-server + fallow-mcp
+ok: getRecommendedMcpConfig exact shape (bunx + npx fallow)
+ok: scope refusal scan (single-session plugin only)
+WAVE 3 ACCEPT: ALL GATES GREEN
