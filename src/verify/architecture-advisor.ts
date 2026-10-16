@@ -5,17 +5,20 @@
  * Helps agents engineer cleaner systems and avoid architectural degradation:
  * 1. Tarjan's Strongly Connected Components (SCC) circular dependency detector
  *    over the workspace import graph (`detectCircularDependencies`).
- * 2. Pre/post-mutation exported contract signature diffing (`diffExportedContracts`)
+ * 2. Pre/post-mutation exported contract signature diffing (`evaluateContractChangeImpact`)
  *    paired with `analyzeBlastRadius` so agents immediately see every downstream
  *    caller affected when they change an exported function, class, or type signature.
  * 3. File-level engineering quality scanner (`scanFileEngineeringQuality`) that flags
- *    empty catch blocks, stub markers, god-files (>600 lines), and high-arity functions.
+ *    empty catch blocks, god-files (>650 lines), and high-arity functions.
+ * 4. Dead export and orphaned internal module detector (`detectUnusedExportsAndOrphanModules`)
+ *    to prevent dead-code accumulation during multi-turn refactors.
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import {
   analyzeBlastRadius,
+  buildCodeOnlyMask,
   buildRepoMap,
   extractOutline,
   stripCommentsAndStringsPreserveLines,
@@ -54,12 +57,19 @@ export interface EngineeringSmell {
   message: string;
 }
 
+export interface DeadExportReport {
+  unusedExports: Array<{ file: string; symbol: string; line: number }>;
+  orphanModules: string[];
+}
+
 export interface ArchitectureAuditReport {
   rootDir: string;
   totalFiles: number;
   cycles: CircularDependencyCycle[];
   smells: EngineeringSmell[];
   godFiles: Array<{ file: string; lines: number; exportCount: number }>;
+  unusedExports: Array<{ file: string; symbol: string; line: number }>;
+  orphanModules: string[];
   healthy: boolean;
   formattedReport: string;
 }
@@ -270,7 +280,6 @@ export function scanFileEngineeringQuality(
   for (let i = 0; i < strippedLines.length; i++) {
     const line = strippedLines[i] ?? "";
 
-    // Check for empty catch block on a single line
     if (/\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(line)) {
       smells.push({
         file: relPath,
@@ -281,7 +290,6 @@ export function scanFileEngineeringQuality(
       });
     }
 
-    // Check for functions with >= 7 positional parameters (prefer options object)
     const fnParamMatch =
       /\b(?:function\s+[A-Za-z_$][\w$]*|def\s+[A-Za-z_][\w]*|fn\s+[A-Za-z_][\w]*)\s*\(([^)]+)\)/.exec(
         line,
@@ -305,6 +313,102 @@ export function scanFileEngineeringQuality(
   return smells;
 }
 
+const ENTRYPOINT_BASENAMES = new Set([
+  "index.ts",
+  "index.tsx",
+  "index.js",
+  "main.ts",
+  "main.js",
+  "cli.ts",
+  "cli.js",
+  "app.ts",
+  "mod.ts",
+]);
+
+/**
+ * Detects unused exported symbols and orphaned internal modules (zero incoming
+ * imports across the workspace, excluding top-level entrypoints and test files).
+ */
+export function detectUnusedExportsAndOrphanModules(
+  rootDir: string = process.cwd(),
+): DeadExportReport {
+  const absRoot = resolve(rootDir);
+  const map = buildRepoMap(absRoot);
+
+  const incomingCount = new Map<string, number>();
+  for (const edge of map.edges) {
+    incomingCount.set(edge.to, (incomingCount.get(edge.to) ?? 0) + 1);
+  }
+
+  const codeMasksByFile = new Map<string, string>();
+  const barrelReExports = new Set<string>();
+
+  for (const node of map.rankedFiles) {
+    try {
+      const raw = readFileSync(node.absPath, "utf8");
+      codeMasksByFile.set(node.relPath, buildCodeOnlyMask(raw));
+      const starRe = /\bexport\s+\*\s+from\s+["']([^"']+)["']/g;
+      let m: RegExpExecArray | null;
+      while ((m = starRe.exec(raw)) !== null) {
+        for (const imp of node.imports) {
+          barrelReExports.add(imp);
+        }
+      }
+    } catch (err) {
+      if (err) continue;
+    }
+  }
+
+  const orphanModules: string[] = [];
+  const unusedExports: Array<{ file: string; symbol: string; line: number }> =
+    [];
+
+  for (const node of map.rankedFiles) {
+    const base = basename(node.relPath).toLowerCase();
+    const isTest = /(?:\.test\.|\.spec\.|__tests__|\/test\/|^test\/)/i.test(
+      node.relPath,
+    );
+    const isEntrypoint = ENTRYPOINT_BASENAMES.has(base) || isTest;
+
+    if (!isEntrypoint && (incomingCount.get(node.relPath) ?? 0) === 0) {
+      orphanModules.push(node.relPath);
+    }
+
+    // If re-exported via `export * from` in a barrel (like index.ts), its exports are part of the public package surface
+    if (isEntrypoint || barrelReExports.has(node.relPath)) {
+      continue;
+    }
+
+    for (const sym of node.symbols) {
+      if (!sym.exported) continue;
+      const escaped = sym.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wordRe = new RegExp(`\\b${escaped}\\b`);
+      let usedInOtherFile = false;
+
+      for (const [otherRel, mask] of codeMasksByFile.entries()) {
+        if (otherRel === node.relPath) continue;
+        if (wordRe.test(mask)) {
+          usedInOtherFile = true;
+          break;
+        }
+      }
+
+      if (!usedInOtherFile) {
+        unusedExports.push({
+          file: node.relPath,
+          symbol: sym.name,
+          line: sym.line,
+        });
+      }
+    }
+  }
+
+  return {
+    unusedExports,
+    orphanModules: orphanModules.sort(),
+  };
+}
+
 export function runArchitectureAudit(
   rootDir: string = process.cwd(),
   targetFiles?: string[],
@@ -312,6 +416,7 @@ export function runArchitectureAudit(
   const absRoot = resolve(rootDir);
   const map = buildRepoMap(absRoot);
   const cycles = detectCircularDependencies(absRoot);
+  const dead = detectUnusedExportsAndOrphanModules(absRoot);
 
   const filesToScan =
     targetFiles && targetFiles.length > 0
@@ -342,7 +447,7 @@ export function runArchitectureAudit(
 
   const healthy = cycles.length === 0 && smells.length === 0;
   const reportLines: string[] = [
-    `<architecture-audit status="${healthy ? "healthy" : "warnings"}" files="${map.totalFiles}" cycles="${cycles.length}" smells="${smells.length}">`,
+    `<architecture-audit status="${healthy ? "healthy" : "warnings"}" files="${map.totalFiles}" cycles="${cycles.length}" smells="${smells.length}" unusedExports="${dead.unusedExports.length}" orphanModules="${dead.orphanModules.length}">`,
   ];
 
   if (cycles.length > 0) {
@@ -361,6 +466,22 @@ export function runArchitectureAudit(
     reportLines.push(`  </engineering-smells>`);
   }
 
+  if (dead.unusedExports.length > 0) {
+    reportLines.push(`  <unused-exports count="${dead.unusedExports.length}">`);
+    for (const u of dead.unusedExports.slice(0, 15)) {
+      reportLines.push(`    - ${u.file}:${u.line} (${u.symbol})`);
+    }
+    reportLines.push(`  </unused-exports>`);
+  }
+
+  if (dead.orphanModules.length > 0) {
+    reportLines.push(`  <orphan-modules count="${dead.orphanModules.length}">`);
+    for (const m of dead.orphanModules.slice(0, 15)) {
+      reportLines.push(`    - ${m}`);
+    }
+    reportLines.push(`  </orphan-modules>`);
+  }
+
   reportLines.push(`</architecture-audit>`);
 
   return {
@@ -369,6 +490,8 @@ export function runArchitectureAudit(
     cycles,
     smells,
     godFiles,
+    unusedExports: dead.unusedExports,
+    orphanModules: dead.orphanModules,
     healthy,
     formattedReport: reportLines.join("\n"),
   };

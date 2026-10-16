@@ -1,7 +1,7 @@
 {
   "name": "@heretek-ai/opencode-harness",
-  "version": "1.0.5",
-  "description": "Plugin-first OpenCode v2 in-process harness for Muse 1.3: zero-patch Edit/Read/Patch/Shell/Subagent interceptors, cross-file import/export contract verification, Dual Direct + Code Mode (tools.harness.*) tools, Hashline edits, AST codemods, PageRank RepoMap, blast-radius & circular-dependency auditing, atomic transactions, KV-cache-safe context budgeting, permission/taint guards, and DOM geometry auditing.",
+  "version": "1.0.6",
+  "description": "Plugin-first OpenCode v2 in-process harness for Muse 1.3: zero-patch Edit/Read/Patch/Shell/Subagent/Retry interceptors, post-formatter FNV-1a anchor resync receipts, cross-file import/export contract verification, atomic multi-file rename_symbol, Dual Direct + Code Mode (tools.harness.*) tools, Hashline edits, AST codemods, PageRank RepoMap, blast-radius & dead-code architecture auditing, atomic transactions, KV-cache-safe context budgeting, permission/taint guards, and DOM geometry auditing.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -24,6 +24,7 @@
     "repomap",
     "blast-radius",
     "symbol-references",
+    "rename-symbol",
     "muse-1.3"
   ],
   "engines": {

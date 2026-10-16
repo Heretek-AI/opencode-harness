@@ -1,12 +1,13 @@
 /**
  * `src/interceptors/session-interceptors.ts` — Plugin-over-patch session, prompt,
- * compaction, and root-affinity interceptors for OpenCode V2 (`opencode-2`).
+ * compaction, retry, and root-affinity interceptors for OpenCode V2 (`opencode-2`).
  *
  * Eliminates the need to patch `packages/core/src/plugin/optimize.ts`,
  * `packages/core/src/plugin/identity.ts`, `packages/core/src/tool/plugin/opencode.ts`,
  * `packages/core/src/plugin/system-prompt/meta.txt`,
- * `packages/core/src/session/compaction.ts`, or `packages/core/src/session/affinity.ts`
- * by running directly inside OpenCode V2's plugin hooks after built-in plugins:
+ * `packages/core/src/session/compaction.ts`, `packages/core/src/session/affinity.ts`,
+ * or `packages/core/src/session/runner/retry.ts` by running directly inside OpenCode V2's
+ * plugin hooks after built-in plugins:
  *
  * 1. `calibrateSystemPromptInPlace`: Runs in `session.hook("context" | "generate")` after
  *    `OptimizePlugin.MetaPlugin`. Repairs the `meta.txt` subagent over-trigger in-place
@@ -20,6 +21,10 @@
  *    unlimited subagent/fork hops and rewrites `x-session-affinity` / `X-Session-Id`
  *    headers in `session.hook("model.request")` so nested subagents reuse the root
  *    session's `promptCacheKey`.
+ * 4. `handleSessionRetryInPlace`: Runs in `session.hook("retry")` to recover from transient
+ *    Muse 1.3 stream truncations (`incomplete-stream`), gateway 502/503/529 blips, and
+ *    overloaded errors while immediately halting retries on non-recoverable auth/permission
+ *    failures.
  */
 
 import { buildMuseSystemOverlay } from "../muse/muse-calibration.js";
@@ -86,7 +91,9 @@ export function decontaminateCompactionEventInPlace(event: {
         t.includes("You are OpenCode, a coding agent") ||
         t.includes("You are OpenCode, an interactive CLI") ||
         t.includes("<muse-1.3-harness-calibration>") ||
-        t.includes("When you create a worktree outside the current working directory") ||
+        t.includes(
+          "When you create a worktree outside the current working directory",
+        ) ||
         t.startsWith("# Your Model\n");
       return !isCodingPrompt;
     });
@@ -165,4 +172,75 @@ export function applyRootAffinityHeadersInPlace(event: {
   event.headers["X-Session-Id"] = rootAffinity;
   event.headers["x-opencode-session"] = rootAffinity;
   return rootAffinity;
+}
+
+export interface SessionRetryEvent {
+  sessionID?: string;
+  agent?: string;
+  model?: { providerID?: string; id?: string };
+  error?: { type?: string; message?: string; code?: string };
+  attempt: number;
+  decision: { retry: false } | { retry: true; delay: number };
+}
+
+/**
+ * Refines `event.decision` in `session.hook("retry")` (`packages/core/src/session/runner/retry.ts`):
+ * - Halts retries immediately (`{ retry: false }`) on deterministic non-recoverable errors
+ *   (`auth`, `invalid_api_key`, `permission`, `model.not-found`, `aborted`) or when `attempt > 6`.
+ * - Enables bounded exponential recovery (`retry: true`, `1000ms * attempt` capped at `5000ms`)
+ *   for transient Muse 1.3 stream drops (`incomplete-stream`), `overloaded`, `rate_limit`,
+ *   `502`/`503`/`504`/`529`, or `ECONNRESET`/`ETIMEDOUT` on `attempt <= 3`.
+ */
+export function handleSessionRetryInPlace(
+  event: SessionRetryEvent,
+): { retry: false } | { retry: true; delay: number } {
+  if (!event || typeof event !== "object") {
+    return { retry: false };
+  }
+
+  const attempt =
+    typeof event.attempt === "number" && Number.isFinite(event.attempt)
+      ? event.attempt
+      : 1;
+  const errType = (event.error?.type ?? "").toLowerCase();
+  const errMsg = (event.error?.message ?? "").toLowerCase();
+  const errCode = (event.error?.code ?? "").toLowerCase();
+  const combined = `${errType} ${errCode} ${errMsg}`;
+
+  // 1. Hard stop on non-recoverable errors or excessive attempts
+  if (
+    attempt > 6 ||
+    /\b(?:auth|unauthorized|invalid_api_key|forbidden|permission|aborted|cancelled|not-found|not_found|context-overflow|context_overflow)\b/.test(
+      combined,
+    )
+  ) {
+    event.decision = { retry: false };
+    return event.decision;
+  }
+
+  // 2. Recover from transient stream drops / gateway blips on attempts 1..3
+  if (
+    attempt <= 3 &&
+    /\b(?:incomplete-stream|incomplete_stream|unknown finish reason|overloaded|rate_limit|ratelimit|502|503|504|529|econnreset|etimedout|socket hang up|temporarily unavailable)\b/.test(
+      combined,
+    )
+  ) {
+    const existingDelay =
+      event.decision?.retry === true &&
+      typeof event.decision.delay === "number" &&
+      event.decision.delay > 0
+        ? event.decision.delay
+        : attempt * 1200;
+    const boundedDelay = Math.min(Math.max(500, existingDelay), 5000);
+    event.decision = { retry: true, delay: boundedDelay };
+    return event.decision;
+  }
+
+  // 3. Cap excessive delays on normal retries so sessions stay responsive
+  if (event.decision?.retry === true) {
+    const capped = Math.min(Math.max(250, event.decision.delay), 10_000);
+    event.decision = { retry: true, delay: capped };
+  }
+
+  return event.decision;
 }
