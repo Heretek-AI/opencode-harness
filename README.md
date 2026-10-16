@@ -44,7 +44,11 @@ Host contract notes:
       "contextBudgetTokens": 4000,
       // Opt-in: add lsp-mcp-server (bunx) and fallow-mcp (npx --yes) when absent.
       // Off by default because both download and run npm packages.
-      "seedRecommendedMcp": false
+      "seedRecommendedMcp": false,
+      // Opt-in: rewrite OpenCode's subagent rule and append the Muse 1.3
+      // tool guidance to the system prompt. Off by default because it changes
+      // the system prompt for every model.
+      "museCalibration": false
     }]
   ]
 }
@@ -54,7 +58,7 @@ For tests or custom hosts, `setupOpenCodeV2Harness(ctx, options)` returns `{ rep
 
 ### KV-cache note on `event.system`
 
-The original spec required `event.system` to stay byte-for-byte unchanged. Since v1.0.4 the `session.hook("context" | "generate")` calibration deliberately rewrites the upstream `meta.txt` subagent bullet and appends a static guidance overlay to `event.system[0]`. The result is identical on every turn, so provider prefix caches still hit; dynamic context (task, plan, lessons) is still appended only to the last user message. If upstream rewords the bullet, a one-line fallback matcher still replaces it.
+The original spec required `event.system` to stay byte-for-byte unchanged. With `museCalibration: true`, the `session.hook("prompt" | "context" | "generate")` calibration deliberately rewrites the upstream `meta.txt` subagent bullet and appends a static guidance overlay to `event.system[0]`. The result is identical on every turn, so provider prefix caches still hit; dynamic context (task, plan, lessons) is still appended only to the last user message. If upstream rewords the bullet, a one-line fallback matcher still replaces it. With the default (`false`), the system prompt is left untouched.
 
 ### 2. Explicit Programmatic Activation (`activate` / `createHarnessPlugin`)
 
@@ -91,7 +95,7 @@ plugin.activate(context);
 | **`ReadTool` Fuzzy Path Resolver & Outline Header** | `tool.hook("execute.before" \| "execute.after")` | Auto-resolves unambiguous moved/mis-pathed filenames in the workspace before `ReadTool` fails, and appends `<file-outline-summary>` on windowed reads of large files. |
 | **`ShellTool` Non-Zero Exit `<fault-context>` Localizer & Env Hardener** | `shell.hook("create.before")`, `tool.hook("execute.after")` | Injects `CI=1`, `GIT_TERMINAL_PROMPT=0`, and `PAGER=cat`; detects non-zero exit codes inside `ShellTool`'s `status: "completed"` (`result.output.exit !== 0`) and appends 4-hex FNV-1a hash-anchored `<fault-context>` stack frames. |
 | **`SubagentTool` SHA-256 `<mutation-receipt>` Verifier** | `tool.hook("execute.before" \| "execute.after")` | Captures pre/post workspace SHA-256 digests around `subagent` calls, appending `<mutation-receipt>` and running syntax/import diagnostics on every file touched by the subagent. |
-| **`MetaPlugin` (`meta.txt`) Calibration & Compaction Decontaminator** | `session.hook("context" \| "generate" \| "compaction")` | Replaces `meta.txt`'s subagent over-trigger in-place, appends static Muse 1.3 tool guidance to `event.system[0]`, sanitizes `<recent-context>` `[Assistant tool call]:` pseudo-transcripts, and strips coding-agent, `# Your Model`, and worktree prompt/tool contamination from `compaction` requests. |
+| **`MetaPlugin` (`meta.txt`) Calibration & Compaction Decontaminator** | `session.hook("context" \| "generate" \| "compaction")` | With `museCalibration: true` (off by default), replaces `meta.txt`'s subagent over-trigger in-place and appends static Muse 1.3 tool guidance to `event.system[0]`. Always sanitizes `<recent-context>` `[Assistant tool call]:` pseudo-transcripts, and strips coding-agent, `# Your Model`, and worktree prompt/tool contamination from `compaction` requests. |
 | **Multi-Hop Root `promptCacheKey` Affinity** | `session.hook("model.request")` | Tracks `childSessionID -> parentSessionID` across unlimited subagent/fork hops and rewrites `x-session-affinity` / `X-Session-Id` headers to the true root session ID. |
 
 ## Tools (`HARNESS_TOOL_NAMES` & `EXTENDED_HARNESS_TOOL_NAMES`)

@@ -218,6 +218,8 @@ export interface HarnessPluginOptions {
   lessons?: LessonInput[];
   /** Opt-in seeding of the recommended MCP servers (default false). */
   seedRecommendedMcp?: boolean;
+  /** Opt-in Muse 1.3 system prompt calibration (default false). */
+  museCalibration?: boolean;
 }
 
 export interface ResolvedHarnessOptions {
@@ -228,6 +230,7 @@ export interface ResolvedHarnessOptions {
   planMd?: string;
   lessons?: LessonInput[];
   seedRecommendedMcp: boolean;
+  museCalibration: boolean;
 }
 
 export interface HarnessPlugin {
@@ -311,11 +314,20 @@ export function resolveHarnessOptions(
       "opencode-harness: seedRecommendedMcp must be a boolean when present (fail-closed)",
     );
   }
+  if (
+    settings.museCalibration !== undefined &&
+    typeof settings.museCalibration !== "boolean"
+  ) {
+    throw new Error(
+      "opencode-harness: museCalibration must be a boolean when present (fail-closed)",
+    );
+  }
   return {
     rootDir,
     guardConfig,
     contextBudgetTokens: Math.floor(budget as number),
     seedRecommendedMcp: settings.seedRecommendedMcp === true,
+    museCalibration: settings.museCalibration === true,
     ...(settings.taskMd !== undefined ? { taskMd: settings.taskMd } : {}),
     ...(settings.planMd !== undefined ? { planMd: settings.planMd } : {}),
     ...(settings.lessons !== undefined ? { lessons: settings.lessons } : {}),
@@ -993,6 +1005,7 @@ export function setupOpenCodeV2Harness(
     workspaceRoot: resolved.rootDir,
     tools,
     seedRecommendedMcp: resolved.seedRecommendedMcp,
+    museCalibration: resolved.museCalibration,
     evaluatePermission: (req) => evaluateBoardGuard(req, resolved.guardConfig),
     recordCircuitBreaker: (ev) => {
       const verdict = recordAndEvaluateCircuitBreaker(ev);

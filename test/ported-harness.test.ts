@@ -391,7 +391,7 @@ describe("ported SwarmOS module 6: episodic memory, Muse 1.3 calibration & OpenC
       },
     };
 
-    const doctor = setupOpenCodeV2Harness(fakePromiseCtx).report;
+    const doctor = setupOpenCodeV2Harness(fakePromiseCtx, { museCalibration: true }).report;
     expect(doctor.healthy).toBe(true);
     expect(addedTools.sort()).toEqual([...EXTENDED_HARNESS_TOOL_NAMES].sort());
 

@@ -385,6 +385,12 @@ export function wireOpenCodeV2PromiseContext(params: {
    * which download and run npm packages the user never configured.
    */
   seedRecommendedMcp?: boolean;
+  /**
+   * Opt-in: rewrite the upstream `meta.txt` subagent bullet and append the
+   * Muse 1.3 guidance overlay to the system prompt. Off by default because it
+   * changes the system prompt for every model, not only Muse 1.3.
+   */
+  museCalibration?: boolean;
 }): DoctorReport {
   const {
     ctx,
@@ -394,6 +400,7 @@ export function wireOpenCodeV2PromiseContext(params: {
     recordCircuitBreaker,
     runContextBudget,
     seedRecommendedMcp = false,
+    museCalibration = false,
   } = params;
 
   const toolNames = Object.keys(tools);
@@ -832,7 +839,7 @@ export function wireOpenCodeV2PromiseContext(params: {
   // 8. Wire `session.hook` (`prompt`, `context`, `generate`, `compaction`, `model.request`, `retry`)
   if (typeof ctx.session?.hook === "function") {
     ctx.session.hook("prompt", (event: OpenCodeV2SessionPromptEvent) => {
-      if (isCompactionAgent(event.agent)) {
+      if (!museCalibration || isCompactionAgent(event.agent)) {
         return;
       }
       if (Array.isArray(event.system)) {
@@ -849,7 +856,7 @@ export function wireOpenCodeV2PromiseContext(params: {
         return;
       }
 
-      if (Array.isArray(event.system)) {
+      if (museCalibration && Array.isArray(event.system)) {
         calibrateSystemPromptInPlace(event.system);
       }
 

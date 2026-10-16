@@ -119,6 +119,55 @@ describe("OpenCode V2 host contract", () => {
   });
 });
 
+describe("Muse 1.3 system prompt calibration option", () => {
+  async function promptHandlers(options?: Record<string, unknown>) {
+    const host = fakeHost();
+    const handlers = new Map<string, (event: never) => unknown>();
+    await OpenCodeV2Plugin.setup({
+      ...host.ctx,
+      ...(options ? { options } : {}),
+      session: {
+        hook: (ev, fn) => {
+          handlers.set(ev, fn as never);
+          return Promise.resolve({ dispose: async () => {} }) as never;
+        },
+      },
+    });
+    return handlers;
+  }
+
+  function events() {
+    const system = [{ text: "You are a coding agent." }];
+    return {
+      prompt: { agent: "builder", system },
+      context: {
+        agent: "builder",
+        system,
+        messages: [{ role: "user", content: "hi" }],
+      },
+    };
+  }
+
+  test("leaves the system prompt untouched by default", async () => {
+    const handlers = await promptHandlers();
+    const { prompt, context } = events();
+    await handlers.get("prompt")!(prompt as never);
+    await handlers.get("context")!(context as never);
+    expect(prompt.system).toEqual([{ text: "You are a coding agent." }]);
+  });
+
+  test("applies the overlay when museCalibration is true", async () => {
+    const handlers = await promptHandlers({ museCalibration: true });
+    const { prompt } = events();
+    await handlers.get("prompt")!(prompt as never);
+    expect(prompt.system[0]!.text).toContain("<muse-1.3-harness-calibration>");
+  });
+
+  test("rejects a non-boolean museCalibration", async () => {
+    expect(promptHandlers({ museCalibration: "yes" })).rejects.toThrow(/museCalibration/);
+  });
+});
+
 describe("hashEditFile partial anchor mismatch", () => {
   async function setupFile(): Promise<string> {
     const root = await mkdtemp(join(tmpdir(), "harness-anchor-"));
