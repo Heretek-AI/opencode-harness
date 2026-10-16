@@ -1,10 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, isAbsolute, relative } from "node:path"
-
-export interface EpisodicLesson {
-  id: string
-  summary: string
-}
+import type { EpisodicLesson } from "./context-budget.js"
 
 export interface EpisodicLessonProposal {
   id: string

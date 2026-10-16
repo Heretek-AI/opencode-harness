@@ -5,7 +5,8 @@
  * upgrades (post-mutation diagnostics, stack-frame fault localizer, atomic
  * edit transactions, stale-read detector, multi-language PageRank RepoMap,
  * blast-radius analyzer, incremental verifier, diff-coverage & anti-tautology
- * auditor, taint tracking, episodic memory, Muse 1.3 calibration, and the
+ * auditor, taint tracking, episodic memory, Muse 1.3 calibration,
+ * architecture advisor, zero-patch tool/session interceptors, and the
  * native OpenCode V2 `PromiseContext` `default` plugin export).
  */
 
@@ -59,6 +60,7 @@ import {
   rollbackCheckpoint,
 } from "./transactions/edit-transaction.js";
 import { runIncrementalVerification } from "./verify/verifier.js";
+import { runArchitectureAudit } from "./verify/architecture-advisor.js";
 import {
   wireOpenCodeV2PromiseContext,
   type OpenCodeV2PromiseContext,
@@ -77,8 +79,16 @@ export * from "./diagnostics/diagnostics-runner.js";
 export * from "./transactions/edit-transaction.js";
 export * from "./repomap/repomap.js";
 export * from "./verify/verifier.js";
+export * from "./verify/architecture-advisor.js";
 export * from "./muse/muse-calibration.js";
+export * from "./interceptors/tool-interceptors.js";
+export * from "./interceptors/session-interceptors.js";
 export * from "./host/contract-adapter.js";
+// Explicit re-export: both `./editors/hashline-tools.js` and
+// `./interceptors/tool-interceptors.js` export `computeLineHash`, so the
+// bare `export *` pair would leave the name ambiguous (and unexported).
+// The explicit export wins and keeps the canonical symbol available.
+export { computeLineHash } from "./editors/hashline-tools.js";
 export { getRecommendedMcpConfig } from "./ui-auditor/mcp-defaults.js";
 export type {
   McpServerEntry,
@@ -87,6 +97,7 @@ export type {
 
 export const HARNESS_NAME = "@heretek-ai/opencode-harness";
 export const HARNESS_VERSION = "1.0.0";
+export const HARNESS_RELEASE_VERSION = "1.0.4";
 
 export const HARNESS_TOOL_NAMES = [
   "file_hash_read",
@@ -104,6 +115,7 @@ export const EXTENDED_HARNESS_TOOL_NAMES = [
   "blast_radius",
   "file_outline",
   "verify_scoped",
+  "architecture_audit",
   "checkpoint_create",
   "checkpoint_rollback",
 ] as const;
@@ -416,6 +428,10 @@ const verifyScopedSchema = z.object({
   timeoutMs: z.number().int().min(500).max(300000).optional(),
 });
 
+const architectureAuditSchema = z.object({
+  files: z.array(z.string().min(1)).optional(),
+});
+
 const checkpointCreateSchema = z.object({
   label: z.string().min(1),
   files: z.array(z.string().min(1)).min(1),
@@ -470,6 +486,46 @@ export interface ContextHookOverrides {
   taskMd?: string;
   planMd?: string;
   lessons?: LessonInput[];
+}
+
+/**
+ * Adapt a circuit-breaker verdict to the `{ tripped, directive }` shape the
+ * OpenCode V2 host adapter consumes.
+ *
+ * Accepts both the canonical Wave-4 verdict (`triggered` / `intervention` /
+ * `message`) and the alternate `tripped` / `directive` shape so either
+ * producer stays compatible; canonical fields win when both are present.
+ * Fail-closed: a missing verdict or non-boolean trip flag throws instead of
+ * silently reporting "not tripped".
+ */
+export function toTrippedDirective(verdict: CircuitBreakerVerdict): {
+  tripped: boolean;
+  directive?: string;
+} {
+  if (verdict === null || typeof verdict !== "object") {
+    throw new Error(
+      "opencode-harness: circuit-breaker verdict must be an object (fail-closed)",
+    );
+  }
+  const foreign = verdict as CircuitBreakerVerdict & {
+    tripped?: unknown;
+    directive?: unknown;
+  };
+  const tripped =
+    typeof foreign.tripped === "boolean" ? foreign.tripped : verdict.triggered;
+  if (typeof tripped !== "boolean") {
+    throw new Error(
+      "opencode-harness: circuit-breaker verdict carries no boolean trip flag (fail-closed)",
+    );
+  }
+  const directive =
+    typeof foreign.directive === "string"
+      ? foreign.directive
+      : (verdict.intervention ?? verdict.message);
+  return {
+    tripped,
+    ...(directive !== undefined ? { directive } : {}),
+  };
 }
 
 export function registerContextBudgetHook(
@@ -655,6 +711,15 @@ export function buildExtendedHarnessTools(
         });
       },
     },
+    architecture_audit: {
+      description:
+        "Audit workspace architecture for circular module dependencies (Tarjan SCC), oversized god-files, empty catch blocks, and high-arity functions.",
+      parameters: architectureAuditSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = architectureAuditSchema.parse(args);
+        return runArchitectureAudit(resolved.rootDir, parsed.files);
+      },
+    },
     checkpoint_create: {
       description:
         "Create an in-memory time-travel snapshot checkpoint for a list of workspace files prior to a risky refactoring sequence.",
@@ -804,8 +869,14 @@ function discoverOptionalWorkspaceFile(
 export const OpenCodeV2Plugin = {
   id: HARNESS_NAME,
   setup(ctx: OpenCodeV2PromiseContext, options?: HarnessPluginOptions) {
+    const inferredRoot =
+      ctx?.directory ??
+      ctx?.worktree ??
+      ctx?.location?.directory ??
+      ctx?.location?.worktree ??
+      process.cwd();
     const resolved = resolveHarnessOptions({
-      rootDir: ctx?.directory ?? ctx?.worktree ?? process.cwd(),
+      rootDir: inferredRoot,
       ...options,
     });
     const tools = buildExtendedHarnessTools(resolved);
@@ -817,10 +888,7 @@ export const OpenCodeV2Plugin = {
         evaluateBoardGuard(req, resolved.guardConfig),
       recordCircuitBreaker: (ev) => {
         const verdict = recordAndEvaluateCircuitBreaker(ev);
-        return {
-          tripped: verdict.triggered,
-          directive: verdict.intervention ?? verdict.message,
-        };
+        return toTrippedDirective(verdict);
       },
       runContextBudget: (ev) => {
         const taskMd =

@@ -32,6 +32,18 @@ export interface LessonInput {
   needsReview?: boolean;
 }
 
+/**
+ * Canonical stored episodic lesson shape (`{ id, summary }`).
+ *
+ * `src/context/episodic-memory.ts` imports this type canonically instead of
+ * redefining it, so `export *` from `src/index.ts` exposes exactly one
+ * `EpisodicLesson` symbol (no `export *` ambiguity).
+ */
+export interface EpisodicLesson {
+  id: string;
+  summary: string;
+}
+
 export interface DynamicArtifacts {
   taskMd?: string;
   planMd?: string;

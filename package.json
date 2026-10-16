@@ -1,7 +1,7 @@
 {
   "name": "@heretek-ai/opencode-harness",
-  "version": "1.0.3",
-  "description": "Lean OpenCode v2 in-process harness plugin: Hashline edits, AST codemods, KV-cache-safe context budgeting, permission guards, and DOM geometry auditing.",
+  "version": "1.0.4",
+  "description": "Plugin-first OpenCode v2 in-process harness for Muse 1.3: zero-patch Edit/Read/Shell/Subagent interceptors, Hashline edits, AST codemods, PageRank RepoMap, blast-radius & circular-dependency auditing, atomic transactions, KV-cache-safe context budgeting, permission/taint guards, and DOM geometry auditing.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,7 +20,10 @@
     "permission-guard",
     "circuit-breaker",
     "context-budget",
-    "dom-audit"
+    "dom-audit",
+    "repomap",
+    "blast-radius",
+    "muse-1.3"
   ],
   "engines": {
     "bun": ">=1.0.0",

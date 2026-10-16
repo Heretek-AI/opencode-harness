@@ -1,0 +1,631 @@
+/**
+ * `src/interceptors/tool-interceptors.ts` — Plugin-over-patch built-in tool
+ * interceptors for OpenCode V2 (`edit`, `read`, `write`, `patch`, `shell`, `subagent`).
+ *
+ * Operates 100% through OpenCode V2's plugin hooks (`tool.hook("execute.before" | "execute.after")`
+ * and `shell.hook("create.before")`) so upstream `opencode-2` does NOT need to be patched:
+ *
+ * 1. `repairEditToolInputInPlace`: Fixes `EditTool` failures before they happen by:
+ *    - Stripping accidental `ReadTool` (`12: `) or `file_hash_read` (`12#a3f2| `) line prefixes
+ *      from `oldString`/`newString` when absent in the target file.
+ *    - Resolving uniform leading indentation drift and trailing whitespace differences by
+ *      snapping `oldString` to the exact verbatim slice in the file and re-indenting `newString`.
+ * 2. `buildEditNearMissContext`: When `edit` still fails, locates the closest matching lines
+ *    in the target file and returns a 4-hex FNV-1a hash-anchored `<near-miss-anchor>` slice so
+ *    Muse 1.3 can immediately apply `file_hash_edit` without an extra `read` turn.
+ * 3. `resolveMissingReadPath`: When `read` targets a non-existent directory/path, searches the
+ *    workspace file graph for matching basenames/suffixes and either auto-resolves a unique match
+ *    in `execute.before` or appends exact repo-relative path suggestions to the error.
+ * 4. `hardenShellEnvironment`: Injects non-interactive environment variables (`CI=1`,
+ *    `GIT_TERMINAL_PROMPT=0`, `PAGER=cat`) in `shell.hook("create.before")` so commands never
+ *    hang waiting for TTY input.
+ * 5. `didShellToolFail` & `extractShellOutputText`: Correctly detects non-zero exit codes in
+ *    OpenCode V2's `ShellTool` (`status === "completed"` with `result.output.exit !== 0`).
+ */
+
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { computeLineHash, hashReadFile } from "../editors/hashline-tools.js";
+
+export interface EditRepairOutcome {
+  repaired: boolean;
+  strategy?: "line-prefix-stripped" | "indentation-aligned";
+  oldString: string;
+  newString: string;
+}
+
+const READ_TOOL_PREFIX_RE = /^\s*\d+:\s?/gm;
+const HASH_READ_PREFIX_RE = /^\s*\d+#[0-9a-f]{4}\|\s?/gm;
+
+function stripKnownLinePrefixes(text: string): {
+  stripped: string;
+  wasStripped: boolean;
+} {
+  const lines = text.split("\n");
+  const nonEmpty = lines.filter((l) => l.trim().length > 0);
+  if (nonEmpty.length === 0) return { stripped: text, wasStripped: false };
+
+  const allHaveHashPrefix = nonEmpty.every((l) =>
+    /^\s*\d+#[0-9a-f]{4}\|(?: |$)/.test(l),
+  );
+  if (allHaveHashPrefix) {
+    return {
+      stripped: lines
+        .map((l) => l.replace(/^\s*\d+#[0-9a-f]{4}\|\s?/, ""))
+        .join("\n"),
+      wasStripped: true,
+    };
+  }
+
+  const allHaveColonPrefix = nonEmpty.every((l) => /^\s*\d+:(?: |$)/.test(l));
+  if (allHaveColonPrefix) {
+    return {
+      stripped: lines.map((l) => l.replace(/^\s*\d+:\s?/, "")).join("\n"),
+      wasStripped: true,
+    };
+  }
+
+  return { stripped: text, wasStripped: false };
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let pos = 0;
+  while (true) {
+    const idx = haystack.indexOf(needle, pos);
+    if (idx === -1) break;
+    count += 1;
+    pos = idx + needle.length;
+  }
+  return count;
+}
+
+function leadingWhitespace(line: string): string {
+  const m = /^[ \t]*/.exec(line);
+  return m ? m[0] : "";
+}
+
+/**
+ * Repairs `event.input` (`{ path, oldString, newString, replaceAll }`) in-place
+ * before OpenCode V2's built-in `EditTool` executes.
+ */
+export function repairEditToolInputInPlace(
+  input: Record<string, unknown> | undefined,
+  workspaceRoot: string = process.cwd(),
+): EditRepairOutcome | null {
+  if (!input || typeof input !== "object") return null;
+  const rawPath =
+    typeof input.path === "string"
+      ? input.path
+      : typeof input.filePath === "string"
+        ? input.filePath
+        : undefined;
+  const oldString =
+    typeof input.oldString === "string" ? input.oldString : undefined;
+  const newString =
+    typeof input.newString === "string" ? input.newString : undefined;
+  const replaceAll = input.replaceAll === true;
+
+  if (!rawPath || oldString === undefined || newString === undefined) {
+    return null;
+  }
+
+  const absPath = isAbsolute(rawPath)
+    ? rawPath
+    : resolve(workspaceRoot, rawPath);
+  if (!existsSync(absPath)) return null;
+
+  let content: string;
+  try {
+    content = readFileSync(absPath, "utf8");
+  } catch (err) {
+    if (err) return null;
+    return null;
+  }
+
+  // If oldString already matches verbatim (once, or >0 with replaceAll), no repair needed
+  const directMatches = countOccurrences(content, oldString);
+  if (directMatches === 1 || (replaceAll && directMatches >= 1)) {
+    return { repaired: false, oldString, newString };
+  }
+
+  // Pass 1: Strip accidental ReadTool ("12: ") or file_hash_read ("12#a3f2| ") prefixes
+  const oldStripped = stripKnownLinePrefixes(oldString);
+  if (
+    oldStripped.wasStripped &&
+    !READ_TOOL_PREFIX_RE.test(content) &&
+    !HASH_READ_PREFIX_RE.test(content)
+  ) {
+    const strippedNew = stripKnownLinePrefixes(newString);
+    const candidateOld = oldStripped.stripped;
+    const candidateNew = strippedNew.wasStripped
+      ? strippedNew.stripped
+      : newString;
+    const matches = countOccurrences(content, candidateOld);
+    if (matches === 1 || (replaceAll && matches >= 1)) {
+      input.oldString = candidateOld;
+      input.newString = candidateNew;
+      return {
+        repaired: true,
+        strategy: "line-prefix-stripped",
+        oldString: candidateOld,
+        newString: candidateNew,
+      };
+    }
+  }
+
+  // Pass 2: Relative indentation & trailing-whitespace alignment
+  const searchSource = oldStripped.wasStripped
+    ? oldStripped.stripped
+    : oldString;
+  const replacementSource = oldStripped.wasStripped
+    ? stripKnownLinePrefixes(newString).stripped
+    : newString;
+
+  const normalizedContent = content.replace(/\r\n/g, "\n");
+  const fileLines = normalizedContent.split("\n");
+  const searchLines = searchSource.replace(/\r\n/g, "\n").split("\n");
+  if (searchLines.length > 0 && searchLines[searchLines.length - 1] === "") {
+    searchLines.pop();
+  }
+
+  if (searchLines.length === 0 || searchLines.length > fileLines.length) {
+    return { repaired: false, oldString, newString };
+  }
+
+  const candidateStarts: number[] = [];
+  for (let i = 0; i <= fileLines.length - searchLines.length; i++) {
+    let allMatch = true;
+    for (let j = 0; j < searchLines.length; j++) {
+      if ((fileLines[i + j] ?? "").trim() !== (searchLines[j] ?? "").trim()) {
+        allMatch = false;
+        break;
+      }
+    }
+    if (allMatch) {
+      candidateStarts.push(i);
+    }
+  }
+
+  if (
+    candidateStarts.length === 1 ||
+    (replaceAll && candidateStarts.length >= 1)
+  ) {
+    const startIdx = candidateStarts[0]!;
+    const matchedFileSlice = fileLines
+      .slice(startIdx, startIdx + searchLines.length)
+      .join("\n");
+
+    // Compute indentation delta from the first non-empty line
+    let indentDelta = "";
+    let stripPrefixLen = 0;
+    for (let j = 0; j < searchLines.length; j++) {
+      if ((searchLines[j] ?? "").trim().length > 0) {
+        const fileIndent = leadingWhitespace(fileLines[startIdx + j] ?? "");
+        const searchIndent = leadingWhitespace(searchLines[j] ?? "");
+        if (fileIndent.length >= searchIndent.length) {
+          indentDelta = fileIndent.slice(searchIndent.length);
+        } else {
+          stripPrefixLen = searchIndent.length - fileIndent.length;
+        }
+        break;
+      }
+    }
+
+    const repLines = replacementSource.replace(/\r\n/g, "\n").split("\n");
+    const hadTrailingNewline = searchSource.endsWith("\n");
+    if (
+      !hadTrailingNewline &&
+      repLines.length > 1 &&
+      repLines[repLines.length - 1] === ""
+    ) {
+      repLines.pop();
+    }
+
+    const adjustedNew = repLines
+      .map((line) => {
+        if (line.trim().length === 0) return "";
+        if (indentDelta) return `${indentDelta}${line}`;
+        if (stripPrefixLen > 0) {
+          const lead = leadingWhitespace(line);
+          const removeCount = Math.min(lead.length, stripPrefixLen);
+          return line.slice(removeCount);
+        }
+        return line;
+      })
+      .join("\n");
+
+    const usesCrlf = content.includes("\r\n");
+    const finalOld = usesCrlf
+      ? matchedFileSlice.replace(/\n/g, "\r\n")
+      : matchedFileSlice;
+    const finalNew = usesCrlf
+      ? adjustedNew.replace(/\n/g, "\r\n")
+      : adjustedNew;
+
+    if (finalOld !== finalNew && content.includes(finalOld)) {
+      input.oldString = finalOld;
+      input.newString = finalNew;
+      return {
+        repaired: true,
+        strategy: "indentation-aligned",
+        oldString: finalOld,
+        newString: finalNew,
+      };
+    }
+  }
+
+  return { repaired: false, oldString, newString };
+}
+
+/**
+ * When `edit` fails with a non-matching `oldString`, finds the closest line in
+ * the target file and returns a 4-hex FNV-1a hash-anchored `<near-miss-anchor>`
+ * block so the model can immediately issue `file_hash_edit` without calling `read`.
+ */
+export async function buildEditNearMissContext(
+  input: Record<string, unknown> | undefined,
+  workspaceRoot: string = process.cwd(),
+): Promise<string> {
+  if (!input || typeof input !== "object") return "";
+  const rawPath =
+    typeof input.path === "string"
+      ? input.path
+      : typeof input.filePath === "string"
+        ? input.filePath
+        : undefined;
+  const oldString =
+    typeof input.oldString === "string" ? input.oldString : undefined;
+  if (!rawPath || !oldString) return "";
+
+  const absRoot = resolve(workspaceRoot);
+  const absPath = isAbsolute(rawPath) ? rawPath : resolve(absRoot, rawPath);
+  if (!existsSync(absPath)) return "";
+
+  const relPath = relative(absRoot, absPath).replace(/\\/g, "/");
+  if (relPath.startsWith("..")) return "";
+
+  const searchLines = stripKnownLinePrefixes(oldString)
+    .stripped.split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 3);
+  if (searchLines.length === 0) return "";
+
+  const firstProbe = searchLines[0]!;
+  const fileLines = readFileSync(absPath, "utf8").split("\n");
+  let bestLine = -1;
+
+  for (let i = 0; i < fileLines.length; i++) {
+    const trimmed = (fileLines[i] ?? "").trim();
+    if (
+      trimmed === firstProbe ||
+      (firstProbe.length >= 6 && trimmed.includes(firstProbe))
+    ) {
+      bestLine = i + 1;
+      break;
+    }
+  }
+
+  if (bestLine === -1) return "";
+
+  try {
+    const startLine = Math.max(1, bestLine - 5);
+    const slice = await hashReadFile(absRoot, relPath, startLine, 12);
+    return [
+      `<near-miss-anchor file="${relPath}" nearLine="${bestLine}" hint="Use file_hash_edit with these 4-hex anchors or copy exact lines">`,
+      slice.content,
+      `</near-miss-anchor>`,
+    ].join("\n");
+  } catch (err) {
+    if (err) return "";
+    return "";
+  }
+}
+
+const IGNORED_SEARCH_DIRS = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  "target",
+]);
+
+function findWorkspaceFilesMatching(
+  rootDir: string,
+  requestedPath: string,
+  maxVisited: number = 1200,
+): string[] {
+  const normReq = requestedPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  const targetBase = basename(normReq).toLowerCase();
+  if (!targetBase) return [];
+
+  const matches: Array<{ rel: string; score: number }> = [];
+  let visited = 0;
+
+  function walk(dir: string): void {
+    if (visited >= maxVisited) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (err) return;
+      return;
+    }
+    for (const entry of entries) {
+      if (visited >= maxVisited) break;
+      if (entry.isDirectory()) {
+        if (IGNORED_SEARCH_DIRS.has(entry.name)) continue;
+        walk(join(dir, entry.name));
+      } else if (entry.isFile()) {
+        visited += 1;
+        const abs = join(dir, entry.name);
+        const rel = relative(rootDir, abs).replace(/\\/g, "/");
+        const lowerBase = entry.name.toLowerCase();
+        if (lowerBase === targetBase) {
+          // Higher score if suffix path segments also match
+          const suffixScore = rel.toLowerCase().endsWith(normReq.toLowerCase())
+            ? 100
+            : 50;
+          matches.push({ rel, score: suffixScore });
+        } else if (lowerBase.includes(targetBase) || targetBase.includes(lowerBase)) {
+          matches.push({ rel, score: 10 });
+        }
+      }
+    }
+  }
+
+  walk(rootDir);
+  matches.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+  return matches.slice(0, 5).map((m) => m.rel);
+}
+
+/**
+ * Inspects `read` tool inputs in `execute.before`. If the requested path does not
+ * exist, searches the workspace for matching files. When `autoRewriteUnique` is true
+ * and there is a single exact-basename match inside the workspace, rewrites `input.path`
+ * in-place so `ReadTool` succeeds without throwing a missing-file error.
+ */
+export function resolveMissingReadPath(
+  input: Record<string, unknown> | undefined,
+  workspaceRoot: string = process.cwd(),
+  autoRewriteUnique: boolean = true,
+): {
+  existed: boolean;
+  rewrittenTo?: string;
+  suggestions: string[];
+} {
+  if (!input || typeof input !== "object" || typeof input.path !== "string") {
+    return { existed: true, suggestions: [] };
+  }
+
+  const absRoot = resolve(workspaceRoot);
+  const rawPath = input.path.trim();
+  if (!rawPath) return { existed: true, suggestions: [] };
+
+  const absTarget = isAbsolute(rawPath) ? rawPath : resolve(absRoot, rawPath);
+  if (existsSync(absTarget)) {
+    return { existed: true, suggestions: [] };
+  }
+
+  const suggestions = findWorkspaceFilesMatching(absRoot, rawPath);
+  const reqBase = basename(rawPath).toLowerCase();
+  const exactBaseMatches = suggestions.filter(
+    (s) => basename(s).toLowerCase() === reqBase,
+  );
+
+  if (autoRewriteUnique && exactBaseMatches.length === 1) {
+    const resolvedRel = exactBaseMatches[0]!;
+    input.path = isAbsolute(rawPath)
+      ? resolve(absRoot, resolvedRel)
+      : resolvedRel;
+    return {
+      existed: false,
+      rewrittenTo: resolvedRel,
+      suggestions: exactBaseMatches,
+    };
+  }
+
+  return {
+    existed: false,
+    suggestions,
+  };
+}
+
+/**
+ * Hardens `shell.hook("create.before")` invocations with non-interactive environment
+ * variables so git/npm/test runners never hang waiting for TTY pagers or prompts.
+ */
+export function hardenShellInvocation(invocation: {
+  command: string;
+  cwd?: string;
+  timeout?: number;
+  shell?: string;
+  env?: Record<string, string | undefined>;
+}): void {
+  if (!invocation || typeof invocation !== "object") return;
+  if (!invocation.env || typeof invocation.env !== "object") {
+    invocation.env = {};
+  }
+  if (invocation.env.CI === undefined) invocation.env.CI = "1";
+  if (invocation.env.GIT_TERMINAL_PROMPT === undefined) {
+    invocation.env.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (invocation.env.PAGER === undefined) invocation.env.PAGER = "cat";
+  if (invocation.env.GIT_PAGER === undefined) invocation.env.GIT_PAGER = "cat";
+}
+
+/**
+ * Accurately determines whether a tool call failed in real OpenCode V2, including
+ * `ShellTool` executions which return `status: "completed"` with `result.output.exit !== 0`.
+ */
+export function didToolExecutionFail(event: {
+  tool?: string;
+  status?: "completed" | "error";
+  result?: {
+    output?: unknown;
+    content?: ReadonlyArray<{ type: string; text?: string }>;
+    metadata?: Record<string, unknown>;
+  };
+  error?: unknown;
+}): boolean {
+  if (event.status === "error") return true;
+  const toolName = (event.tool ?? "").toLowerCase();
+  if (toolName === "shell" || toolName === "bash") {
+    const out = event.result?.output;
+    if (out && typeof out === "object" && "exit" in out) {
+      const exitCode = (out as { exit?: unknown }).exit;
+      if (typeof exitCode === "number" && exitCode !== 0) {
+        return true;
+      }
+    }
+    const metaExit = event.result?.metadata?.exit;
+    if (typeof metaExit === "number" && metaExit !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extracts the textual output from an OpenCode V2 `ToolHooks["execute.after"]` event
+ * across both `result.content` (`Array<{ type: "text", text }>`) and `result.output`.
+ */
+export function extractToolOutputText(event: {
+  result?: {
+    output?: unknown;
+    content?: ReadonlyArray<{ type: string; text?: string }>;
+  };
+  error?: { message?: string } | string;
+}): string {
+  const parts: string[] = [];
+  if (Array.isArray(event.result?.content)) {
+    for (const item of event.result!.content) {
+      if (item && item.type === "text" && typeof item.text === "string") {
+        parts.push(item.text);
+      }
+    }
+  }
+  const out = event.result?.output;
+  if (typeof out === "string") {
+    parts.push(out);
+  } else if (out && typeof out === "object" && "output" in out) {
+    const nested = (out as { output?: unknown }).output;
+    if (typeof nested === "string") parts.push(nested);
+  }
+  if (typeof event.error === "string") {
+    parts.push(event.error);
+  } else if (
+    event.error &&
+    typeof event.error === "object" &&
+    typeof event.error.message === "string"
+  ) {
+    parts.push(event.error.message);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Appends text blocks to an OpenCode V2 `ToolHooks["execute.after"]` event in-place,
+ * supporting both real OpenCode V2 (`result.content` array & `error.message`) and
+ * simplified string `result.output` test harnesses.
+ */
+export function appendBlocksToToolAfterEvent(
+  event: {
+    status: "completed" | "error";
+    result?: {
+      output?: unknown;
+      content?: Array<{ type: string; text?: string }>;
+      metadata?: Record<string, unknown>;
+    };
+    error?: { message?: string } | string;
+  },
+  blocks: string[],
+): void {
+  const filtered = blocks.filter((b) => b && b.trim().length > 0);
+  if (filtered.length === 0) return;
+  const suffix = filtered.join("\n");
+
+  if (event.status === "error") {
+    if (typeof event.error === "string") {
+      event.error = `${event.error}\n\n${suffix}`;
+    } else if (event.error && typeof event.error === "object") {
+      const prevMsg = event.error.message ?? "Tool error";
+      event.error.message = `${prevMsg}\n\n${suffix}`;
+    }
+    if (event.result && typeof event.result.output === "string") {
+      event.result.output = event.result.output
+        ? `${event.result.output}\n\n${suffix}`
+        : suffix;
+    }
+    return;
+  }
+
+  if (!event.result) return;
+
+  if (Array.isArray(event.result.content)) {
+    event.result.content = [
+      ...event.result.content,
+      { type: "text", text: suffix },
+    ];
+  }
+
+  if (typeof event.result.output === "string") {
+    event.result.output = event.result.output
+      ? `${event.result.output}\n\n${suffix}`
+      : suffix;
+  }
+}
+
+/**
+ * Wraps a raw tool execution result into OpenCode V2's `Tool.Result` contract
+ * (`{ content: [{ type: "text", text }], metadata }`) so `packages/core/src/tool/runtime.ts`
+ * never calls `Effect.die("Tool result declared output without an output schema")`.
+ */
+export function normalizePluginToolResult(raw: unknown): {
+  content: Array<{ type: "text"; text: string }>;
+  metadata?: Record<string, unknown>;
+  [k: string]: unknown;
+} {
+  if (raw === null || raw === undefined) {
+    return { content: [{ type: "text", text: "" }] };
+  }
+  if (typeof raw === "string") {
+    return { content: [{ type: "text", text: raw }] };
+  }
+  if (typeof raw === "object") {
+    const rec = raw as Record<string, unknown>;
+    if (
+      Array.isArray(rec.content) &&
+      rec.content.every(
+        (item) => item && typeof item === "object" && "type" in item,
+      ) &&
+      !("output" in rec)
+    ) {
+      return rec as {
+        content: Array<{ type: "text"; text: string }>;
+        metadata?: Record<string, unknown>;
+      };
+    }
+    // Avoid leaving a top-level `output` property when no `output` schema is declared
+    const { output: rawOutput, content: rawContent, ...rest } = rec;
+    const textBody =
+      typeof rawContent === "string"
+        ? rawContent
+        : typeof rec.formatted === "string"
+          ? rec.formatted
+          : typeof rec.formattedReport === "string"
+            ? rec.formattedReport
+            : JSON.stringify(raw, null, 2);
+    return {
+      ...rest,
+      ...(rawOutput !== undefined ? { rawOutput } : {}),
+      content: [{ type: "text", text: textBody }],
+    };
+  }
+  return { content: [{ type: "text", text: String(raw) }] };
+}
+
+export { computeLineHash };
