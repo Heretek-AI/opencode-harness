@@ -1,0 +1,79 @@
+# Wave 5 Red-Proof Sabotage Log — QA Agent
+
+- **Worktree:** `/home/john/Projects/Heretek-AI-Rebuild/opencode-harness/worktrees/wave-5`
+- **Branch:** `wave-5-interceptors` (commit `7f5fec9` + wave-5 work)
+- **Date (UTC):** 2026-10-16
+- **Baseline (clean tree):**
+  - `bun run check` (`tsc --noEmit`): exit 0
+  - `bun test`: **183 pass, 0 fail** (665 `expect()` calls, 10 files)
+  - `bash scripts/accept/wave-5.sh`: exit 0, `WAVE 5 ACCEPT: ALL GATES GREEN`
+    (65 direct `ok:` lines; waves 1–4 sublogs 15+26+40+68 = 149 `ok:` lines;
+    214 total `ok:`, 0 `FAIL:`)
+  - `bash scripts/accept/wave-{1,2,3,4}.sh` individually: exits 0
+    (ok = 15 / 26 / 40 / 68, fail = 0 each)
+
+## Red-proof A — Wave-5 module (`runArchitectureAudit` / interceptor surface)
+
+1. **Condition asserted:** `wave-5.sh` Gate 1 (`bun run check` exits 0) and
+   Gate 2 (`bun test` exits 0); `src/index.ts:63` and
+   `src/host/contract-adapter.ts:51` import `runArchitectureAudit` from
+   `./verify/architecture-advisor.js`.
+2. **Sabotage (minimal, temporary):** in
+   `src/verify/architecture-advisor.ts`, renamed the export
+   `runArchitectureAudit(` → `runArchitectureAudit_BROKEN(` (one-line edit via
+   native `edit` tool; no other files touched).
+3. **Check run — EXPECTED FAIL (defective if it had passed):**
+   - `bun run check` → exit **2** (FAIL). `tsc --noEmit` errors:
+     - `src/host/contract-adapter.ts(51,3): error TS2305: Module
+       '"../verify/architecture-advisor.js"' has no exported member
+       'runArchitectureAudit'.`
+     - `src/index.ts(63,10): error TS2305: ... has no exported member
+       'runArchitectureAudit'.`
+     - `test/plugin-interceptors.test.ts(24,3): error TS2614: Module
+       '"../src/index"' has no exported member 'runArchitectureAudit'.`
+     (full output: `/tmp/redA-check.log`)
+   - `bash scripts/accept/wave-5.sh` → exit **1** (FAIL), first failures:
+     - `FAIL: bun run check (tsc --noEmit)`
+     - `FAIL: bun test (full suite incl. plugin-interceptors)`
+     - `FAIL: bun test test/plugin-interceptors.test.ts`
+     (full output: `/tmp/redA-wave5.log`)
+   - Verdict: checks are NOT vacuous for the Wave-5 surface — breaking the
+     new architecture-advisor export is caught at Gate 1.
+4. **Revert:** `git checkout -- src/verify/architecture-advisor.ts` → exit 0.
+5. **Clean check:** `git status --short` → empty (clean); `bun run check`
+   → exit 0.
+
+## Red-proof B — Prior invariant (permission-guard Rules 1–4 deny path)
+
+1. **Condition asserted:** `wave-1.sh` gate `bun test (editors, guards,
+   circuit-breaker, bootstrap)` exits 0; `deny()` in
+   `src/guards/permission-guard.ts:160-162` returns `{ allowed: false, … }`
+   so destructive shell (Rule 1), leadership writes (Rule 2), QA writes to
+   `src/**` (Rule 3), and non-architect contract writes (Rule 4) are denied.
+2. **Sabotage (minimal, temporary):** in `src/guards/permission-guard.ts`,
+   changed `deny()` body `return { allowed: false, reason, rule };` →
+   `return { allowed: true, reason, rule };` (one-line edit; every deny path
+   now permits).
+3. **Check run — EXPECTED FAIL:**
+   - `bun test test/guards.test.ts` → exit **1**: **11 pass, 8 fail**
+     (53 `expect()` calls, full output: `/tmp/redB-guards.log`).
+   - `bash scripts/accept/wave-1.sh` → exit **1** (FAIL):
+     - `FAIL: bun test (editors, guards, circuit-breaker, bootstrap)`
+     (full output: `/tmp/redB-wave1.log`)
+   - Verdict: Wave-1 regression checks are NOT vacuous — flipping the prior
+     guard invariant is caught by both the unit suite and the accept script.
+4. **Revert:** `git checkout -- src/guards/permission-guard.ts` → exit 0.
+5. **Clean check:** `git status --short` → empty (clean).
+6. **Restoration log (post-revert, clean tree):**
+   - `bun test` → **183 pass, 0 fail** (665 `expect()` calls, 10 files)
+   - `bash scripts/accept/wave-5.sh` → exit 0,
+     `WAVE 5 ACCEPT: ALL GATES GREEN` (full output: `/tmp/wave5-restore.log`)
+
+## Handoff gate
+
+- `git status --short` after both reverts: **completely clean** (no
+  uncommitted `src/`/`test/` modifications; only this new evidence file
+  `docs/evidence/wave-5/red-proofs.log` added).
+- Both sabotage edits were made with the native `edit` tool (never bash
+  redirection) and reverted exclusively via `git checkout -- <file>`.
+- No commits made; no subagents spawned (evaluator role only).
