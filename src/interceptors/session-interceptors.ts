@@ -47,7 +47,7 @@ function replaceSubagentOvertriggerLine(text: string): string | undefined {
   const index = lines.findIndex((line) => {
     if (!line.startsWith("- ")) return false;
     const toolAt = line.indexOf("`subagent` tool");
-    return toolAt !== -1 && line.indexOf("context token usage", toolAt) !== -1;
+    return toolAt >= 0 && line.includes("context token usage", toolAt);
   });
   if (index === -1) return undefined;
   lines[index] = CALIBRATED_SUBAGENT_RULE;

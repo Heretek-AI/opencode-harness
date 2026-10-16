@@ -13,13 +13,13 @@ OPENCODE_REF="${OPENCODE_REF:-ed772f5009755b5262805a7ba07e66e1417f140a}"
 OPENCODE_REPO="${OPENCODE_REPO:-https://github.com/anomalyco/opencode.git}"
 
 cleanup_dir=""
-if [ -z "${OPENCODE_DIR:-}" ]; then
+if [[ -z "${OPENCODE_DIR:-}" ]]; then
   OPENCODE_DIR="$(mktemp -d)"
   cleanup_dir="$OPENCODE_DIR"
 fi
-trap '[ -n "$cleanup_dir" ] && rm -rf "$cleanup_dir"' EXIT
+trap '[[ -n "$cleanup_dir" ]] && rm -rf "$cleanup_dir"' EXIT
 
-if [ ! -d "$OPENCODE_DIR/.git" ]; then
+if [[ ! -d "$OPENCODE_DIR/.git" ]]; then
   git -C "$OPENCODE_DIR" init -q
   git -C "$OPENCODE_DIR" remote add origin "$OPENCODE_REPO"
 fi
@@ -32,7 +32,7 @@ git -C "$OPENCODE_DIR" checkout -q --force FETCH_HEAD
 if ! (cd "$OPENCODE_DIR" && bun install --ignore-scripts >/dev/null); then
   echo "warning: bun install in the OpenCode checkout reported failures; continuing" >&2
 fi
-(cd "$HARNESS_ROOT" && bun install >/dev/null)
+(cd "$HARNESS_ROOT" && bun install --ignore-scripts >/dev/null)
 
 target="$OPENCODE_DIR/packages/core/test/plugin/zz-opencode-harness-host.test.ts"
 cp "$HARNESS_ROOT/scripts/host-test/harness-host.upstream.ts" "$target"

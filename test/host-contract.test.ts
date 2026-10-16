@@ -91,6 +91,19 @@ describe("OpenCode V2 host contract", () => {
     expect([...host.disposed].sort()).toEqual([...host.registered].sort());
   });
 
+  test("a dispose that throws synchronously does not stop the others", async () => {
+    const host = fakeHost();
+    const failing = { dispose: () => { throw new Error("boom"); } };
+    const ctx = {
+      ...host.ctx,
+      tool: { ...host.ctx.tool, hook: () => Promise.resolve(failing) as never },
+    };
+    const cleanup = await OpenCodeV2Plugin.setup(ctx);
+    await cleanup();
+    expect(host.disposed.length).toBeGreaterThan(0);
+    expect([...host.disposed].sort()).toEqual([...host.registered].sort());
+  });
+
   test("plugin options arrive on ctx.options", async () => {
     const host = fakeHost();
     const seeded = new Map<string, unknown>();
