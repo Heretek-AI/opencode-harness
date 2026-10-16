@@ -1,32 +1,16 @@
 /**
  * `src/index.ts` — Unified OpenCode v2 plugin entrypoint.
  *
- * Wave 3 module per `docs/prompts/SPEC.md` Section 2.5. Wires every Wave 1
- * and Wave 2 module into a single in-process OpenCode v2 plugin:
- *
- * - Tools: `file_hash_read`, `file_hash_edit` (hash-anchored II/O over
- *   `src/editors/hashline-tools.ts`), `ast_structural_search`,
- *   `ast_structural_rewrite` (`src/editors/ast-codemod.ts`), and
- *   `ui_geometry_audit` (deterministic `evaluateDomGeometryInPage` plus the
- *   live `auditLivePageWithPlaywright` from `src/ui-auditor/dom-auditor.ts`).
- * - Hooks: `permission.hook("evaluate")` delegates to `evaluateBoardGuard`
- *   (`src/guards/permission-guard.ts`, backed by the
- *   `src/guards/shell-parse.ts` classifier); `tool.execute.after` records
- *   every attempt through `recordAndEvaluateCircuitBreaker`
- *   (`src/guards/circuit-breaker.ts`); `session.hook("context")` runs
- *   `registerContextBudgetHook`, which packs blocks with `packBlocks` /
- *   `buildDynamicContextBlocks` and injects them with
- *   `injectContextBudgetIntoMessages` (`src/context/context-budget.ts`)
- *   without ever mutating `event.system`.
- * - `getRecommendedMcpConfig()` is re-exported from
- *   `src/ui-auditor/mcp-defaults.ts` and returns exactly the `lsp-mcp-server`
- *   (`bunx`) and `fallow-mcp` (`npx --yes --package fallow`) blocks.
- *
- * Every value, type, and constant from the Wave 1 and Wave 2 modules is
- * re-exported below so no module is left unwired. All invalid inputs fail
- * closed with descriptive domain errors.
+ * Wires Wave 1–3 modules plus the ported SwarmOS single-session harness
+ * upgrades (post-mutation diagnostics, stack-frame fault localizer, atomic
+ * edit transactions, stale-read detector, multi-language PageRank RepoMap,
+ * blast-radius analyzer, incremental verifier, diff-coverage & anti-tautology
+ * auditor, taint tracking, episodic memory, Muse 1.3 calibration, and the
+ * native OpenCode V2 `PromiseContext` `default` plugin export).
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   astRewriteFile,
@@ -63,14 +47,38 @@ import {
   type DomElementInput,
   type ViewportInput,
 } from "./ui-auditor/dom-auditor.js";
+import {
+  analyzeBlastRadius,
+  buildRepoMap,
+  extractOutline,
+  formatBlastRadiusBlock,
+  formatRepoMapBlock,
+} from "./repomap/repomap.js";
+import {
+  createCheckpoint,
+  rollbackCheckpoint,
+} from "./transactions/edit-transaction.js";
+import { runIncrementalVerification } from "./verify/verifier.js";
+import {
+  wireOpenCodeV2PromiseContext,
+  type OpenCodeV2PromiseContext,
+} from "./host/contract-adapter.js";
 
 export * from "./editors/hashline-tools.js";
 export * from "./editors/ast-codemod.js";
 export * from "./guards/shell-parse.js";
 export * from "./guards/permission-guard.js";
 export * from "./guards/circuit-breaker.js";
+export * from "./guards/taint-guard.js";
 export * from "./context/context-budget.js";
+export * from "./context/episodic-memory.js";
 export * from "./ui-auditor/dom-auditor.js";
+export * from "./diagnostics/diagnostics-runner.js";
+export * from "./transactions/edit-transaction.js";
+export * from "./repomap/repomap.js";
+export * from "./verify/verifier.js";
+export * from "./muse/muse-calibration.js";
+export * from "./host/contract-adapter.js";
 export { getRecommendedMcpConfig } from "./ui-auditor/mcp-defaults.js";
 export type {
   McpServerEntry,
@@ -90,6 +98,19 @@ export const HARNESS_TOOL_NAMES = [
 
 export type HarnessToolName = (typeof HARNESS_TOOL_NAMES)[number];
 
+export const EXTENDED_HARNESS_TOOL_NAMES = [
+  ...HARNESS_TOOL_NAMES,
+  "repo_map",
+  "blast_radius",
+  "file_outline",
+  "verify_scoped",
+  "checkpoint_create",
+  "checkpoint_rollback",
+] as const;
+
+export type ExtendedHarnessToolName =
+  (typeof EXTENDED_HARNESS_TOOL_NAMES)[number];
+
 export const HARNESS_HOOK_NAMES = [
   "permission.evaluate",
   "tool.execute.after",
@@ -104,13 +125,11 @@ export const DEFAULT_CONTEXT_BUDGET_TOKENS = 4000;
 /* Plugin host types (minimal OpenCode v2 surface)                     */
 /* ------------------------------------------------------------------ */
 
-/** Per-invocation ambient data handed to tool `execute` functions. */
 export interface ToolContext {
   sessionId?: string;
   role?: string;
 }
 
-/** A registered harness tool: validated args plus a fail-closed executor. */
 export interface ToolDefinition {
   description: string;
   parameters: z.ZodTypeAny;
@@ -120,12 +139,10 @@ export interface ToolDefinition {
   ) => Promise<unknown>;
 }
 
-/** Permission evaluation handler (`permission.hook("evaluate")`). */
 export type PermissionEvaluateHandler = (
   request: GuardRequest,
 ) => GuardVerdict | Promise<GuardVerdict>;
 
-/** A single tool execution observed after it ran. */
 export interface ToolAfterEvent {
   sessionId: string;
   tool: string;
@@ -135,21 +152,18 @@ export interface ToolAfterEvent {
   error?: string;
 }
 
-/** Post-execution observer (`tool.execute.after`). */
 export type ToolAfterHandler = (
   event: ToolAfterEvent,
-) => CircuitBreakerVerdict | Promise<CircuitBreakerVerdict> | void | Promise<void>;
+) =>
+  | CircuitBreakerVerdict
+  | Promise<CircuitBreakerVerdict>
+  | void
+  | Promise<void>;
 
-/** Dynamic-context hook (`session.hook("context")`). */
 export type SessionContextHandler = (
   event: SessionEvent,
 ) => void | Promise<void>;
 
-/**
- * Callable tool registrar carrying the post-execution hook namespace, so
- * `context.tool(name, def)` registers tools and
- * `context.tool.execute.after(handler)` observes executions.
- */
 export interface ToolRegistrar {
   (name: string, definition: ToolDefinition): void;
   execute: {
@@ -157,17 +171,14 @@ export interface ToolRegistrar {
   };
 }
 
-/** Permission hook namespace (`permission.hook("evaluate", handler)`). */
 export interface PermissionHookRegistrar {
   hook: (event: "evaluate", handler: PermissionEvaluateHandler) => void;
 }
 
-/** Session hook namespace (`session.hook("context", handler)`). */
 export interface SessionHookRegistrar {
   hook: (event: "context", handler: SessionContextHandler) => void;
 }
 
-/** Minimal OpenCode v2 plugin context consumed by `activate`. */
 export interface PluginContext {
   tool: ToolRegistrar;
   permission: PermissionHookRegistrar;
@@ -178,7 +189,6 @@ export interface PluginContext {
 /* Plugin options                                                     */
 /* ------------------------------------------------------------------ */
 
-/** Construction options for `createHarnessPlugin`. All fields optional. */
 export interface HarnessPluginOptions {
   rootDir?: string;
   guardConfig?: GuardPolicyConfig;
@@ -188,7 +198,6 @@ export interface HarnessPluginOptions {
   lessons?: LessonInput[];
 }
 
-/** Fully resolved options (every default applied, fail-closed validated). */
 export interface ResolvedHarnessOptions {
   rootDir: string;
   guardConfig: GuardPolicyConfig;
@@ -198,7 +207,6 @@ export interface ResolvedHarnessOptions {
   lessons?: LessonInput[];
 }
 
-/** The created harness plugin: metadata plus its `activate` closure. */
 export interface HarnessPlugin {
   name: string;
   version: string;
@@ -208,17 +216,14 @@ export interface HarnessPlugin {
   activate: (context: PluginContext) => void;
 }
 
-/**
- * Resolve caller options into concrete settings. Unknown or malformed
- * fields throw (fail-closed) instead of silently adopting permissive
- * defaults.
- */
 export function resolveHarnessOptions(
   options?: HarnessPluginOptions,
 ): ResolvedHarnessOptions {
   if (options !== undefined) {
     const isRecord =
-      typeof options === "object" && options !== null && Array.isArray(options) === false;
+      typeof options === "object" &&
+      options !== null &&
+      Array.isArray(options) === false;
     if (isRecord === false) {
       throw new Error(
         "opencode-harness: plugin options must be an object when present (fail-closed)",
@@ -227,8 +232,7 @@ export function resolveHarnessOptions(
   }
   const settings: HarnessPluginOptions = options ?? {};
   const cwd = process.cwd();
-  const rootDir =
-    settings.rootDir !== undefined ? settings.rootDir : cwd;
+  const rootDir = settings.rootDir !== undefined ? settings.rootDir : cwd;
   if (typeof rootDir !== "string" || rootDir.trim() === "") {
     throw new Error(
       "opencode-harness: rootDir must be a non-empty string (fail-closed)",
@@ -268,7 +272,10 @@ export function resolveHarnessOptions(
       "opencode-harness: planMd must be a string when present (fail-closed)",
     );
   }
-  if (settings.lessons !== undefined && Array.isArray(settings.lessons) === false) {
+  if (
+    settings.lessons !== undefined &&
+    Array.isArray(settings.lessons) === false
+  ) {
     throw new Error(
       "opencode-harness: lessons must be an array when present (fail-closed)",
     );
@@ -391,16 +398,37 @@ const uiGeometryAuditSchema: z.ZodType<UiGeometryAuditArgs> = z.object({
   viewports: z.array(viewportSchema).min(1).optional(),
 });
 
+const repoMapSchema = z.object({
+  topK: z.number().int().min(1).max(200).optional(),
+});
+
+const blastRadiusSchema = z.object({
+  path: z.string().min(1),
+  symbol: z.string().min(1).optional(),
+});
+
+const fileOutlineSchema = z.object({
+  path: z.string().min(1),
+});
+
+const verifyScopedSchema = z.object({
+  modifiedFiles: z.array(z.string().min(1)).optional(),
+  timeoutMs: z.number().int().min(500).max(300000).optional(),
+});
+
+const checkpointCreateSchema = z.object({
+  label: z.string().min(1),
+  files: z.array(z.string().min(1)).min(1),
+});
+
+const checkpointRollbackSchema = z.object({
+  checkpointId: z.string().min(1).optional(),
+});
+
 /* ------------------------------------------------------------------ */
 /* Hook implementations                                               */
 /* ------------------------------------------------------------------ */
 
-/**
- * Record one post-execution observation and evaluate the doom-loop
- * circuit breaker. Thin adapter over `recordToolAttempt`: the command
- * prefix is derived with `commandPrefixOf` so shell streaks group by
- * their first two tokens. Invalid observations throw (fail-closed).
- */
 export function recordAndEvaluateCircuitBreaker(
   event: ToolAfterEvent,
 ): CircuitBreakerVerdict {
@@ -436,7 +464,6 @@ export function recordAndEvaluateCircuitBreaker(
   });
 }
 
-/** Overrides accepted by `registerContextBudgetHook` for managed sessions. */
 export interface ContextHookOverrides {
   rootDir?: string;
   budgetTokens?: number;
@@ -445,15 +472,6 @@ export interface ContextHookOverrides {
   lessons?: LessonInput[];
 }
 
-/**
- * Build dynamic context blocks (`buildDynamicContextBlocks`), fit them
- * into the token budget (`packBlocks`), and inject the packed text into
- * the session event (`injectContextBudgetIntoMessages`). The injection
- * preserves the KV-cache prefix: `event.system` is never touched and the
- * wrapped context lands strictly on the last `role === "user"` message.
- * An empty pack (no artifacts configured) is a strict no-op; a pack with
- * content but no user message throws (fail-closed).
- */
 export function registerContextBudgetHook(
   event: SessionEvent,
   overrides?: ContextHookOverrides,
@@ -485,14 +503,9 @@ export function registerContextBudgetHook(
 }
 
 /* ------------------------------------------------------------------ */
-/* Tool table                                                         */
+/* Tool tables                                                        */
 /* ------------------------------------------------------------------ */
 
-/**
- * Build the five harness tool definitions bound to `resolved` settings.
- * Every executor validates its args with zod first (fail-closed) and then
- * delegates to the underlying Wave 1 / Wave 2 implementation.
- */
 export function buildHarnessTools(
   resolved: ResolvedHarnessOptions,
 ): Record<HarnessToolName, ToolDefinition> {
@@ -580,6 +593,114 @@ export function buildHarnessTools(
   };
 }
 
+export function buildExtendedHarnessTools(
+  resolved: ResolvedHarnessOptions,
+): Record<ExtendedHarnessToolName, ToolDefinition> {
+  const core = buildHarnessTools(resolved);
+  return {
+    ...core,
+    repo_map: {
+      description:
+        "Compute a PageRank-ranked repository dependency map showing top architectural modules and their exported symbols.",
+      parameters: repoMapSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = repoMapSchema.parse(args);
+        const map = buildRepoMap(resolved.rootDir);
+        return {
+          totalFiles: map.totalFiles,
+          formatted: formatRepoMapBlock(map, parsed.topK ?? 15),
+          rankedFiles: map.rankedFiles.slice(0, parsed.topK ?? 15),
+        };
+      },
+    },
+    blast_radius: {
+      description:
+        "Analyze the direct importers, transitive dependents, symbol callers, and affected test files for a target module before mutating its public contract.",
+      parameters: blastRadiusSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = blastRadiusSchema.parse(args);
+        const res = analyzeBlastRadius(
+          parsed.path,
+          resolved.rootDir,
+          parsed.symbol,
+        );
+        return {
+          ...res,
+          formatted: formatBlastRadiusBlock(res),
+        };
+      },
+    },
+    file_outline: {
+      description:
+        "Extract a compact structural symbol outline (functions, classes, interfaces, types, structs) with 1-based line numbers without reading the full file body.",
+      parameters: fileOutlineSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = fileOutlineSchema.parse(args);
+        return {
+          path: parsed.path,
+          symbols: extractOutline(`${resolved.rootDir}/${parsed.path}`),
+        };
+      },
+    },
+    verify_scoped: {
+      description:
+        "Run blast-radius-scoped incremental verification (typecheck, lint, and affected tests) and return structured file:line:col failure locations.",
+      parameters: verifyScopedSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = verifyScopedSchema.parse(args);
+        return runIncrementalVerification({
+          rootDir: resolved.rootDir,
+          modifiedFiles: parsed.modifiedFiles,
+          timeoutMs: parsed.timeoutMs,
+        });
+      },
+    },
+    checkpoint_create: {
+      description:
+        "Create an in-memory time-travel snapshot checkpoint for a list of workspace files prior to a risky refactoring sequence.",
+      parameters: checkpointCreateSchema,
+      execute: async (
+        args: Record<string, unknown>,
+        ctx?: ToolContext,
+      ): Promise<unknown> => {
+        const parsed = checkpointCreateSchema.parse(args);
+        const entry = createCheckpoint(
+          ctx?.sessionId ?? "default",
+          parsed.label,
+          parsed.files,
+          resolved.rootDir,
+        );
+        return {
+          checkpointId: entry.id,
+          label: entry.label,
+          fileCount: entry.snapshots.length,
+        };
+      },
+    },
+    checkpoint_rollback: {
+      description:
+        "Restore workspace files to a previously created checkpoint snapshot.",
+      parameters: checkpointRollbackSchema,
+      execute: async (
+        args: Record<string, unknown>,
+        ctx?: ToolContext,
+      ): Promise<unknown> => {
+        const parsed = checkpointRollbackSchema.parse(args);
+        const outcome = rollbackCheckpoint(
+          ctx?.sessionId ?? "default",
+          parsed.checkpointId,
+        );
+        if (!outcome) {
+          throw new Error(
+            "checkpoint_rollback: no matching checkpoint found for session (fail-closed)",
+          );
+        }
+        return outcome;
+      },
+    },
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* Activation                                                         */
 /* ------------------------------------------------------------------ */
@@ -599,9 +720,7 @@ function assertValidPluginContext(context: PluginContext): void {
   ) {
     missing.push("tool.execute.after(handler)");
   }
-  if (
-    typeof (context as PluginContext).permission?.hook !== "function"
-  ) {
+  if (typeof (context as PluginContext).permission?.hook !== "function") {
     missing.push('permission.hook("evaluate", handler)');
   }
   if (typeof (context as PluginContext).session?.hook !== "function") {
@@ -641,19 +760,10 @@ function activateWithOptions(
   });
 }
 
-/**
- * Activate the harness plugin with default settings (workspace root at
- * `process.cwd()`, default guard policy, default context budget) against
- * an OpenCode v2 plugin context.
- */
 export function activate(context: PluginContext): void {
   activateWithOptions(context, resolveHarnessOptions());
 }
 
-/**
- * Create a configured harness plugin. The returned `activate` closure
- * registers the five tools and three hooks bound to the resolved options.
- */
 export function createHarnessPlugin(
   options?: HarnessPluginOptions,
 ): HarnessPlugin {
@@ -669,3 +779,74 @@ export function createHarnessPlugin(
     },
   };
 }
+
+function discoverOptionalWorkspaceFile(
+  rootDir: string,
+  candidates: string[],
+): string | undefined {
+  for (const rel of candidates) {
+    const abs = join(rootDir, rel);
+    if (existsSync(abs)) {
+      try {
+        return readFileSync(abs, "utf8");
+      } catch (err) {
+        if (err) continue;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Native OpenCode V2 `PluginModule` default export (`{ id, setup(ctx) }`)
+ * consumed by `packages/core/src/plugin/module.ts`.
+ */
+export const OpenCodeV2Plugin = {
+  id: HARNESS_NAME,
+  setup(ctx: OpenCodeV2PromiseContext, options?: HarnessPluginOptions) {
+    const resolved = resolveHarnessOptions({
+      rootDir: ctx?.directory ?? ctx?.worktree ?? process.cwd(),
+      ...options,
+    });
+    const tools = buildExtendedHarnessTools(resolved);
+    return wireOpenCodeV2PromiseContext({
+      ctx,
+      workspaceRoot: resolved.rootDir,
+      tools,
+      evaluatePermission: (req) =>
+        evaluateBoardGuard(req, resolved.guardConfig),
+      recordCircuitBreaker: (ev) => {
+        const verdict = recordAndEvaluateCircuitBreaker(ev);
+        return {
+          tripped: verdict.triggered,
+          directive: verdict.intervention ?? verdict.message,
+        };
+      },
+      runContextBudget: (ev) => {
+        const taskMd =
+          resolved.taskMd ??
+          discoverOptionalWorkspaceFile(resolved.rootDir, [
+            "TASK.md",
+            ".opencode/task.md",
+          ]);
+        const planMd =
+          resolved.planMd ??
+          discoverOptionalWorkspaceFile(resolved.rootDir, [
+            "PLAN.md",
+            ".opencode/plan.md",
+          ]);
+        registerContextBudgetHook(ev, {
+          rootDir: resolved.rootDir,
+          budgetTokens: resolved.contextBudgetTokens,
+          ...(taskMd !== undefined ? { taskMd } : {}),
+          ...(planMd !== undefined ? { planMd } : {}),
+          ...(resolved.lessons !== undefined
+            ? { lessons: resolved.lessons }
+            : {}),
+        });
+      },
+    });
+  },
+};
+
+export default OpenCodeV2Plugin;
