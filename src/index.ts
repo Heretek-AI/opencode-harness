@@ -945,13 +945,12 @@ function trackHostRegistrations(
 
 async function disposeRegistrations(registrations: unknown[]): Promise<void> {
   const settled = await Promise.allSettled(registrations.map((r) => Promise.resolve(r)));
-  for (const outcome of settled) {
-    if (outcome.status !== "fulfilled") continue;
+  const disposals = settled.map((outcome) => {
+    if (outcome.status !== "fulfilled") return undefined;
     const reg = outcome.value as { dispose?: () => unknown } | undefined;
-    if (reg && typeof reg.dispose === "function") {
-      await reg.dispose();
-    }
-  }
+    return reg && typeof reg.dispose === "function" ? reg.dispose() : undefined;
+  });
+  await Promise.allSettled(disposals);
 }
 
 export interface OpenCodeV2SetupResult {
