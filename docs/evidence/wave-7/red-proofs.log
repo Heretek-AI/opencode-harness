@@ -1,0 +1,130 @@
+# Wave 7 QA Red-Proof Sabotage Log — agency-qa
+# Worktree: worktrees/wave-7 | Commit: 76ccb31 | Date: 2026-10-16
+# Spec: docs/reports/wave-7.md (v1.0.6) + AGENTS.md + docs/prompts/SPEC.md + docs/prompts/verify-stage.md
+# Baseline expectation: 194 pass, 0 fail across 12 test files (189 prior Waves 1-6 + 5 in test/wave7-systems.test.ts)
+
+## BASELINE (clean tree, no sabotage)
+$ make check
+  $ bun run check        # tsc --noEmit -> EXIT 0
+  $ bun test             # 194 pass, 0 fail, 744 expect() calls, 12 files -> EXIT 0
+  => make check EXIT: 0 (FINAL_CHECK_EXIT:0, /tmp/wave7-final-check.log)
+$ bash scripts/accept/wave-7.sh
+  ok: bun run check (tsc --noEmit)
+  ok: bun test (full suite incl. wave7-systems)   # 194 pass
+  ok: bun test test/wave7-systems.test.ts (5 wave7 tests)  # 5 pass
+  ok: wave-1 regression
+  ok: wave-2 regression
+  ok: wave-3 regression
+  ok: wave-4 regression
+  ok: wave-5 regression
+  ok: wave-6 regression
+  ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+  ok: export present: renameSymbolAcrossWorkspace / rename_symbol / buildPostMutationAnchorReceipt / handleSessionRetryInPlace / detectUnusedExportsAndOrphanModules / trackCircuitBreakerAndAutoProposeLesson
+  ok: all relative imports in src/ use .js extensions
+  ok: scope refusal scan (single-session plugin only)
+  WAVE 7 ACCEPT: ALL GATES GREEN -> EXIT 0 (FINAL_W7_EXIT:0, /tmp/wave7-final-accept.log)
+
+## RED-PROOF 1 (NEW Wave 7): lexer-safe atomic rename_symbol engine
+1. Condition asserted: renameSymbolAcrossWorkspace() in src/repomap/repomap.ts
+   must replace whole-word identifiers only in live code (buildCodeOnlyMask),
+   report totalReplacements=3 + applied=true; asserted by
+   test/wave7-systems.test.ts capability 1 (expects applied=true, 3 replacements
+   across math.ts + checkout.ts, comments/strings untouched) and
+   scripts/accept/wave-7.sh Gates 2/3/6.
+2. Sabotage (minimal, via native edit tool): src/repomap/repomap.ts
+     if (fromSym === toSym) {
+       throw new Error(...);
+     }
+   + return { oldSymbol: fromSym, newSymbol: toSym, applied: false, rolledBack: false,
+   +   modifiedFiles: [], totalReplacements: 0, diagnosticsErrors: [],
+   +   formattedBlock: `<symbol-rename ... status="noop" ... />` };
+   (rename engine blinded — always reports noop, writes nothing)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/wave7-systems.test.ts > /tmp/wave7-sab1-unit.log 2>&1
+     (fail) Wave 7 capability 1 ... expect(outcome.applied).toBe(true) / Received: false
+       (test/wave7-systems.test.ts:81)
+     4 pass, 1 fail, 26 expect() calls -> EXIT 1 (SABOTAGE1_UNIT_EXIT:1)
+   $ bash scripts/accept/wave-7.sh > /tmp/wave7-sab1-accept.log 2>&1
+     WAVE 7 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE1_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/repomap/repomap.ts -> REVERT1b_EXIT:0
+5. Clean: $ git status --short -> (empty, no output) STATUS_CLEAN1b_DONE
+6. Restoration run:
+   $ bun test test/wave7-systems.test.ts -> 5 pass, 0 fail, 35 expect() calls -> EXIT 0 (RESTORE1_EXIT:0)
+
+## RED-PROOF 2 (NEW Wave 7): adaptive session.hook("retry") recovery
+1. Condition asserted: handleSessionRetryInPlace() in
+   src/interceptors/session-interceptors.ts must return {retry:true,delay>=500}
+   for transient incomplete-stream / 503 overload on attempt<=3 and
+   {retry:false} for fatal auth/context-overflow; asserted by
+   test/wave7-systems.test.ts capabilities 3+5 (expects retry=true on
+   incomplete-stream and 503, retry=false on auth) and wave-7.sh Gate 2/3.
+2. Sabotage (minimal, via native edit tool): src/interceptors/session-interceptors.ts
+   -  if (!event || typeof event !== "object") {
+   -    return { retry: false };
+   -  }
+   +  event.decision = { retry: false };
+   +  return event.decision;
+   (retry interceptor blinded — never recovers, always halts)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/wave7-systems.test.ts > /tmp/wave7-sab2-unit.log 2>&1
+     (fail) Wave 7 capability 3 ... + (fail) Wave 7 capability 5 retry-hook wiring
+       (test/wave7-systems.test.ts:298)
+     3 pass, 2 fail, 30 expect() calls -> EXIT 1 (SABOTAGE2_UNIT_EXIT:1)
+   $ bash scripts/accept/wave-7.sh > /tmp/wave7-sab2-accept.log 2>&1
+     WAVE 7 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE2_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/interceptors/session-interceptors.ts -> REVERT2_EXIT:0
+5. Clean: $ git status --short -> (empty, no output) STATUS_CLEAN2_DONE
+6. Restoration run:
+   $ bun test test/wave7-systems.test.ts -> 5 pass, 0 fail, 35 expect() calls -> EXIT 0 (RESTORE2_EXIT:0)
+
+## RED-PROOF 3 (NEW Wave 7): post-mutation & post-formatter anchor resync receipt
+1. Condition asserted: buildPostMutationAnchorReceipt() in
+   src/interceptors/tool-interceptors.ts must diff beforeContent vs post-formatter
+   afterContent and emit fresh 4-hex FNV-1a `<post-edit-anchors file lines totalLines>`
+   block; asserted by test/wave7-systems.test.ts capabilities 2+5 (expects
+   lines="1-5", `2#<hash>| const formattedValue =`, and afterEv combined contains
+   `<post-edit-anchors file="src/parsers/json-parser.ts"`) and wave-7.sh Gate 2/3.
+2. Sabotage (minimal, via native edit tool): src/interceptors/tool-interceptors.ts
+   -  const rootDir = resolve(params.workspaceRoot ?? process.cwd());
+   +  return "";
+   (receipt blinded — emits empty string, follow-up edits would drift)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/wave7-systems.test.ts > /tmp/wave7-sab3-unit.log 2>&1
+     (fail) capability 2 + (fail) capability 5 post-edit anchor assertion
+       (test/wave7-systems.test.ts:322)
+     3 pass, 2 fail, 34 expect() calls -> EXIT 1 (SABOTAGE3_UNIT_EXIT:1)
+   $ bash scripts/accept/wave-7.sh > /tmp/wave7-sab3-accept.log 2>&1
+     WAVE 7 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE3_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/interceptors/tool-interceptors.ts -> REVERT3_EXIT:0
+5. Clean: $ git status --short -> (empty, no output) STATUS_CLEAN3_DONE
+6. Restoration run:
+   $ bun test test/wave7-systems.test.ts -> 5 pass, 0 fail, 35 expect() calls -> EXIT 0 (RESTORE3_EXIT:0)
+
+## RED-PROOF 4 (PRIOR invariant, Wave 1): 4-hex FNV-1a computeLineHash + fail-closed hash anchors
+1. Condition asserted: computeLineHash() in src/editors/hashline-tools.ts must be the
+   deterministic 4-hex FNV-1a of trimmed content and hashEditFile must fail closed
+   on anchor mismatch with +/-25-line recovery; asserted by test/editors.test.ts
+   (26 tests) and scripts/accept/wave-1.sh.
+2. Sabotage (minimal, via native edit tool): src/editors/hashline-tools.ts
+   -    return narrowed.toString(16).padStart(4, "0");
+   +    return "0000";
+   (constant hash collapses all anchors — shifted-anchor + fail-closed logic blinded)
+3. Failing run (proves check is NOT vacuous):
+   $ bun test test/editors.test.ts > /tmp/wave7-sab4-unit.log 2>&1
+     (fail) hashEditFile > fails closed when the anchor drifted beyond the 25-line window
+       (test/editors.test.ts:228) (+ 2 further fails)
+     23 pass, 3 fail, 63 expect() calls -> EXIT 1 (SABOTAGE4_UNIT_EXIT:1)
+   $ bash scripts/accept/wave-1.sh > /tmp/wave7-sab4-accept.log 2>&1
+     WAVE 1 ACCEPT: GATES FAILED -> EXIT 1 (SABOTAGE4_ACCEPT_EXIT:1)
+4. Revert: $ git checkout -- src/editors/hashline-tools.ts -> REVERT4_EXIT:0
+5. Clean: $ git status --short -> (empty, no output) STATUS_CLEAN4_DONE
+6. Restoration run:
+   $ bun test test/editors.test.ts -> 26 pass, 0 fail, 65 expect() calls -> EXIT 0 (RESTORE4_EXIT:0)
+
+## FINAL RESTORATION (all sabotages reverted)
+$ make check -> 194 pass, 0 fail, 744 expect() calls, 12 files -> FINAL_CHECK_EXIT:0
+$ bash scripts/accept/wave-7.sh -> WAVE 7 ACCEPT: ALL GATES GREEN -> FINAL_W7_EXIT:0
+$ git status --short -> (empty — no uncommitted src/test modifications) FINAL_STATUS_DONE
+# Only new untracked evidence files are docs/evidence/wave-7/red-proofs.log (this file)
+# and docs/evidence/wave-7/qa-run.log, staged via `git add` (no commit per QA contract).
+# QA changed NO production code. All sabotage edits reverted via `git checkout -- <file>`.

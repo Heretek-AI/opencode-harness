@@ -1,6 +1,11 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { computeLineHash } from "../editors/hashline-tools.js";
+import {
+  beginEditTransaction,
+  finalizeEditTransaction,
+} from "../transactions/edit-transaction.js";
+import { collectFileDiagnostics } from "../diagnostics/diagnostics-runner.js";
 
 export interface SymbolOutlineItem {
   name: string;
@@ -60,6 +65,17 @@ export interface SymbolReferencesResult {
   formattedBlock: string;
 }
 
+export interface SymbolRenameResult {
+  oldSymbol: string;
+  newSymbol: string;
+  applied: boolean;
+  rolledBack: boolean;
+  modifiedFiles: string[];
+  totalReplacements: number;
+  diagnosticsErrors: string[];
+  formattedBlock: string;
+}
+
 const IGNORED_DIRS = new Set([
   ".git",
   "node_modules",
@@ -87,8 +103,8 @@ const CODE_EXTENSIONS = new Set([
 ]);
 
 /**
- * Strips comments and string literals while preserving line breaks so line numbers
- * and import/export regexes never match fake imports inside comments or strings.
+ * Strips comments and multi-line template strings while preserving line breaks
+ * and single-line string literals (for module import specifier extraction).
  */
 export function stripCommentsAndStringsPreserveLines(source: string): string {
   let out = "";
@@ -217,6 +233,17 @@ export function stripCommentsAndStringsPreserveLines(source: string): string {
   }
 
   return out;
+}
+
+/**
+ * Strips comments AND all string literal bodies (`'...'`, `"..."`, `` `...` ``)
+ * to spaces of the exact same character length so character offsets and line
+ * numbers in the returned mask match the original source 1-to-1.
+ */
+export function buildCodeOnlyMask(source: string): string {
+  return stripCommentsAndStringsPreserveLines(source)
+    .replace(/"(?:\\.|[^"\\\n])*"/g, (m) => `"${" ".repeat(Math.max(0, m.length - 2))}"`)
+    .replace(/'(?:\\.|[^'\\\n])*'/g, (m) => `'${" ".repeat(Math.max(0, m.length - 2))}'`);
 }
 
 export function extractOutline(
@@ -671,9 +698,7 @@ export function findSymbolReferences(
     if (!raw.includes(trimmed)) continue;
 
     const rel = relative(absRoot, abs).replace(/\\/g, "/");
-    const stripped = stripCommentsAndStringsPreserveLines(raw)
-      .replace(/"(?:\\.|[^"\\\n])*"/g, (m) => "\"" + " ".repeat(Math.max(0, m.length - 2)) + "\"")
-      .replace(/'(?:\\.|[^'\\\n])*'/g, (m) => "'" + " ".repeat(Math.max(0, m.length - 2)) + "'");
+    const stripped = buildCodeOnlyMask(raw);
     const strippedLines = stripped.split("\n");
     const rawLines = raw.split("\n");
     const outline = extractOutline(abs, raw);
@@ -751,6 +776,159 @@ export function formatSymbolReferencesBlock(res: {
   }
   lines.push(`</symbol-references>`);
   return lines.join("\n");
+}
+
+/**
+ * Lexer-safe, atomic multi-file symbol rename engine (`renameSymbolAcrossWorkspace`).
+ *
+ * Replaces whole-word identifier occurrences of `oldSymbol` with `newSymbol`
+ * ONLY where the character-aligned `buildCodeOnlyMask` confirms the token is in
+ * live code (never inside comments or string literals). Wraps all touched files
+ * in an atomic transaction (`beginEditTransaction` / `finalizeEditTransaction`)
+ * and verifies every modified file with `collectFileDiagnostics`, rolling back
+ * all files if any syntax or cross-file import/export error is introduced.
+ */
+export function renameSymbolAcrossWorkspace(
+  oldSymbol: string,
+  newSymbol: string,
+  rootDir: string = process.cwd(),
+  sessionId: string = "rename-tx",
+): SymbolRenameResult {
+  const fromSym = oldSymbol.trim();
+  const toSym = newSymbol.trim();
+  const identRe = /^[A-Za-z_$][\w$]*$/;
+
+  if (!identRe.test(fromSym) || !identRe.test(toSym)) {
+    throw new Error(
+      `renameSymbolAcrossWorkspace: both oldSymbol (${JSON.stringify(oldSymbol)}) and newSymbol (${JSON.stringify(newSymbol)}) must be valid identifiers (fail-closed)`,
+    );
+  }
+  if (fromSym === toSym) {
+    throw new Error(
+      "renameSymbolAcrossWorkspace: newSymbol must differ from oldSymbol (fail-closed)",
+    );
+  }
+
+  const absRoot = resolve(rootDir);
+  const absFiles = walkWorkspaceFiles(absRoot, 1200);
+  const escaped = fromSym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const wordGlobalRe = new RegExp(`\\b${escaped}\\b`, "g");
+
+  const plannedWrites: Array<{
+    absPath: string;
+    relPath: string;
+    updatedContent: string;
+    replacements: number;
+  }> = [];
+
+  for (const abs of absFiles) {
+    let raw = "";
+    try {
+      raw = readFileSync(abs, "utf8");
+    } catch (err) {
+      if (err) continue;
+    }
+    if (!raw.includes(fromSym)) continue;
+
+    const codeMask = buildCodeOnlyMask(raw);
+    const spans: Array<{ start: number; end: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = wordGlobalRe.exec(codeMask)) !== null) {
+      spans.push({ start: m.index, end: m.index + fromSym.length });
+    }
+    if (spans.length === 0) continue;
+
+    let updated = raw;
+    for (let i = spans.length - 1; i >= 0; i--) {
+      const sp = spans[i]!;
+      updated = updated.slice(0, sp.start) + toSym + updated.slice(sp.end);
+    }
+
+    if (updated !== raw) {
+      plannedWrites.push({
+        absPath: abs,
+        relPath: relative(absRoot, abs).replace(/\\/g, "/"),
+        updatedContent: updated,
+        replacements: spans.length,
+      });
+    }
+  }
+
+  if (plannedWrites.length === 0) {
+    return {
+      oldSymbol: fromSym,
+      newSymbol: toSym,
+      applied: false,
+      rolledBack: false,
+      modifiedFiles: [],
+      totalReplacements: 0,
+      diagnosticsErrors: [],
+      formattedBlock: `<symbol-rename from="${fromSym}" to="${toSym}" status="noop" files="0" replacements="0" />`,
+    };
+  }
+
+  beginEditTransaction(
+    sessionId,
+    "rename_symbol",
+    plannedWrites.map((p) => p.absPath),
+    absRoot,
+  );
+
+  let totalReplacements = 0;
+  for (const item of plannedWrites) {
+    writeFileSync(item.absPath, item.updatedContent, "utf8");
+    totalReplacements += item.replacements;
+  }
+
+  const diagnosticsErrors: string[] = [];
+  for (const item of plannedWrites) {
+    const diag = collectFileDiagnostics(item.absPath, absRoot);
+    if (!diag.clean) {
+      for (const d of diag.diagnostics) {
+        diagnosticsErrors.push(
+          `${item.relPath}:${d.line}:${d.column} (${d.source}) - ${d.message}`,
+        );
+      }
+    }
+  }
+
+  if (diagnosticsErrors.length > 0) {
+    finalizeEditTransaction(sessionId, false);
+    const formattedBlock = [
+      `<symbol-rename from="${fromSym}" to="${toSym}" status="rolled-back" errors="${diagnosticsErrors.length}">`,
+      ...diagnosticsErrors.slice(0, 10).map((e) => `  [ERROR] ${e}`),
+      `</symbol-rename>`,
+    ].join("\n");
+    return {
+      oldSymbol: fromSym,
+      newSymbol: toSym,
+      applied: false,
+      rolledBack: true,
+      modifiedFiles: [],
+      totalReplacements: 0,
+      diagnosticsErrors,
+      formattedBlock,
+    };
+  }
+
+  finalizeEditTransaction(sessionId, true);
+  const modifiedFiles = plannedWrites.map((p) => p.relPath).sort();
+  const formattedBlock = [
+    `<symbol-rename from="${fromSym}" to="${toSym}" status="applied" files="${modifiedFiles.length}" replacements="${totalReplacements}">`,
+    ...modifiedFiles.map((f) => `  - ${f}`),
+    `</symbol-rename>`,
+  ].join("\n");
+
+  return {
+    oldSymbol: fromSym,
+    newSymbol: toSym,
+    applied: true,
+    rolledBack: false,
+    modifiedFiles,
+    totalReplacements,
+    diagnosticsErrors: [],
+    formattedBlock,
+  };
 }
 
 /**

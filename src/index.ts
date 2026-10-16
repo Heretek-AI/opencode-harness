@@ -5,10 +5,11 @@
  * upgrades (post-mutation diagnostics, cross-file import/export verifier,
  * stack-frame fault localizer, atomic edit transactions, stale-read detector,
  * multi-language PageRank RepoMap, blast-radius analyzer, symbol reference
- * finder, incremental verifier, diff-coverage & anti-tautology auditor,
- * taint tracking, episodic memory, Muse 1.3 calibration, architecture advisor,
- * zero-patch tool/session interceptors, and the native OpenCode V2
- * `PromiseContext` `default` plugin export).
+ * finder, atomic multi-file rename_symbol engine, incremental verifier,
+ * diff-coverage & anti-tautology auditor, taint tracking, episodic memory,
+ * Muse 1.3 calibration, architecture advisor, zero-patch tool/session
+ * interceptors, and the native OpenCode V2 `PromiseContext` `default`
+ * plugin export).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -56,6 +57,7 @@ import {
   findSymbolReferences,
   formatBlastRadiusBlock,
   formatRepoMapBlock,
+  renameSymbolAcrossWorkspace,
 } from "./repomap/repomap.js";
 import {
   createCheckpoint,
@@ -100,7 +102,7 @@ export type {
 
 export const HARNESS_NAME = "@heretek-ai/opencode-harness";
 export const HARNESS_VERSION = "1.0.0";
-export const HARNESS_RELEASE_VERSION = "1.0.5";
+export const HARNESS_RELEASE_VERSION = "1.0.6";
 
 export const HARNESS_TOOL_NAMES = [
   "file_hash_read",
@@ -118,6 +120,7 @@ export const EXTENDED_HARNESS_TOOL_NAMES = [
   "blast_radius",
   "file_outline",
   "symbol_references",
+  "rename_symbol",
   "verify_scoped",
   "architecture_audit",
   "checkpoint_create",
@@ -432,6 +435,11 @@ const symbolReferencesSchema = z.object({
   maxResults: z.number().int().min(1).max(500).optional(),
 });
 
+const renameSymbolSchema = z.object({
+  oldSymbol: z.string().min(1),
+  newSymbol: z.string().min(1),
+});
+
 const verifyScopedSchema = z.object({
   modifiedFiles: z.array(z.string().min(1)).optional(),
   timeoutMs: z.number().int().min(500).max(300000).optional(),
@@ -710,6 +718,23 @@ export function buildExtendedHarnessTools(
         );
       },
     },
+    rename_symbol: {
+      description:
+        "Atomically rename an exported or local symbol across all definitions, imports, exports, and call sites in the workspace (ignoring comments and string literals), with automatic syntax/import verification and rollback on error.",
+      parameters: renameSymbolSchema,
+      execute: async (
+        args: Record<string, unknown>,
+        ctx?: ToolContext,
+      ): Promise<unknown> => {
+        const parsed = renameSymbolSchema.parse(args);
+        return renameSymbolAcrossWorkspace(
+          parsed.oldSymbol,
+          parsed.newSymbol,
+          resolved.rootDir,
+          ctx?.sessionId ?? "rename-tx",
+        );
+      },
+    },
     verify_scoped: {
       description:
         "Run blast-radius-scoped incremental verification (typecheck, lint, and affected tests) and return structured file:line:col failure locations.",
@@ -725,7 +750,7 @@ export function buildExtendedHarnessTools(
     },
     architecture_audit: {
       description:
-        "Audit workspace architecture for circular module dependencies (Tarjan SCC), oversized god-files, empty catch blocks, and high-arity functions.",
+        "Audit workspace architecture for circular module dependencies (Tarjan SCC), unused exported symbols, orphan modules, oversized god-files, empty catch blocks, and high-arity functions.",
       parameters: architectureAuditSchema,
       execute: async (args: Record<string, unknown>): Promise<unknown> => {
         const parsed = architectureAuditSchema.parse(args);

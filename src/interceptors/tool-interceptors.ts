@@ -16,15 +16,18 @@
  * 3. `buildEditNearMissContext`: When `edit` still fails, locates the closest matching lines
  *    in the target file and returns a 4-hex FNV-1a hash-anchored `<near-miss-anchor>` slice so
  *    Muse 1.3 can immediately apply `file_hash_edit` without an extra `read` turn.
- * 4. `resolveMissingReadPath`: When `read` targets a non-existent directory/path, searches the
+ * 4. `buildPostMutationAnchorReceipt`: After a successful file mutation (and after OpenCode V2's
+ *    `Formatter.file` may have reflowed lines on disk), computes the modified line window and
+ *    returns fresh 4-hex FNV-1a `<post-edit-anchors>` lines so follow-up edits never drift.
+ * 5. `resolveMissingReadPath`: When `read` targets a non-existent directory/path, searches the
  *    workspace file graph for matching basenames/suffixes and either auto-resolves a unique match
  *    in `execute.before` or appends exact repo-relative path suggestions to the error.
- * 5. `hardenShellInvocation`: Injects non-interactive environment variables (`CI=1`,
+ * 6. `hardenShellInvocation`: Injects non-interactive environment variables (`CI=1`,
  *    `GIT_TERMINAL_PROMPT=0`, `PAGER=cat`) in `shell.hook("create.before")` so commands never
  *    hang waiting for TTY input.
- * 6. `didToolExecutionFail` & `extractToolOutputText`: Correctly detects non-zero exit codes in
+ * 7. `didToolExecutionFail` & `extractToolOutputText`: Correctly detects non-zero exit codes in
  *    OpenCode V2's `ShellTool` (`status === "completed"` with `result.output.exit !== 0`).
- * 7. `compactToolOutputHeadTail`: Prevents `ToolOutput.truncate` (`packages/core/src/tool-output.ts`,
+ * 8. `compactToolOutputHeadTail`: Prevents `ToolOutput.truncate` (`packages/core/src/tool-output.ts`,
  *    which runs AFTER `execute.after` and blindly drops lines past `2,000` / `50 KiB`) from slicing
  *    off the error tail and appended `<diagnostics>` / `<fault-context>` / `<circuit-breaker>` blocks.
  */
@@ -411,6 +414,88 @@ export async function buildEditNearMissContext(
   }
 }
 
+/**
+ * Computes the mutated line window after `edit`, `write`, `patch`, `file_hash_edit`,
+ * or `ast_structural_rewrite` (including any silent reflows by OpenCode V2's
+ * `Formatter.file`) and returns a `<post-edit-anchors>` block with fresh 4-hex
+ * FNV-1a line hashes (`<lineNo>#<hash>| <content>`) so follow-up edits never drift.
+ */
+export function buildPostMutationAnchorReceipt(params: {
+  filePath: string;
+  beforeContent?: string;
+  afterContent: string;
+  workspaceRoot?: string;
+  contextRadius?: number;
+  maxLines?: number;
+}): string {
+  const rootDir = resolve(params.workspaceRoot ?? process.cwd());
+  const absPath = isAbsolute(params.filePath)
+    ? params.filePath
+    : resolve(rootDir, params.filePath);
+  const relPath = relative(rootDir, absPath).replace(/\\/g, "/");
+
+  const afterLines = params.afterContent.replace(/\r\n/g, "\n").split("\n");
+  if (
+    afterLines.length > 0 &&
+    afterLines[afterLines.length - 1] === "" &&
+    params.afterContent.endsWith("\n")
+  ) {
+    afterLines.pop();
+  }
+  if (afterLines.length === 0) return "";
+
+  const radius = params.contextRadius ?? 2;
+  const maxLines = params.maxLines ?? 20;
+
+  let startDiffIdx = 0;
+  let endDiffIdx = Math.min(afterLines.length - 1, maxLines - 1);
+
+  if (params.beforeContent !== undefined) {
+    const beforeLines = params.beforeContent.replace(/\r\n/g, "\n").split("\n");
+    if (
+      beforeLines.length > 0 &&
+      beforeLines[beforeLines.length - 1] === "" &&
+      params.beforeContent.endsWith("\n")
+    ) {
+      beforeLines.pop();
+    }
+
+    let prefix = 0;
+    const minLen = Math.min(beforeLines.length, afterLines.length);
+    while (prefix < minLen && beforeLines[prefix] === afterLines[prefix]) {
+      prefix += 1;
+    }
+
+    let suffix = 0;
+    while (
+      suffix < minLen - prefix &&
+      beforeLines[beforeLines.length - 1 - suffix] ===
+        afterLines[afterLines.length - 1 - suffix]
+    ) {
+      suffix += 1;
+    }
+
+    startDiffIdx = Math.max(0, prefix - radius);
+    const rawEnd = Math.max(prefix, afterLines.length - 1 - suffix) + radius;
+    endDiffIdx = Math.min(
+      afterLines.length - 1,
+      Math.min(rawEnd, startDiffIdx + maxLines - 1),
+    );
+  }
+
+  const anchored: string[] = [];
+  for (let i = startDiffIdx; i <= endDiffIdx; i++) {
+    const lineText = afterLines[i] ?? "";
+    anchored.push(`${i + 1}#${computeLineHash(lineText)}| ${lineText}`);
+  }
+
+  return [
+    `<post-edit-anchors file="${relPath}" lines="${startDiffIdx + 1}-${endDiffIdx + 1}" totalLines="${afterLines.length}">`,
+    ...anchored,
+    `</post-edit-anchors>`,
+  ].join("\n");
+}
+
 const IGNORED_SEARCH_DIRS = new Set([
   ".git",
   "node_modules",
@@ -621,11 +706,6 @@ export function extractToolOutputText(event: {
  * Compacts oversized tool output using a head+tail window (keeping the first 35%
  * and last 65% of lines/bytes) BEFORE OpenCode V2's `ToolOutput.truncate`
  * (`packages/core/src/tool-output.ts`, 2,000 lines / 50 KiB) runs after `execute.after`.
- *
- * Without head+tail compaction, `ToolOutput.truncate` keeps only the first 50 KiB
- * from the top of `result.content` and slices off the bottom—destroying compiler error
- * summaries, stack traces at the end of test logs, and our appended `<diagnostics>`,
- * `<fault-context>`, and `<circuit-breaker>` blocks.
  */
 export function compactToolOutputHeadTail(
   text: string,
@@ -644,7 +724,9 @@ export function compactToolOutputHeadTail(
   const tailLineCount = Math.max(20, maxLines - headLineCount);
 
   let headLines = lines.slice(0, headLineCount);
-  let tailLines = lines.slice(Math.max(headLineCount, lines.length - tailLineCount));
+  let tailLines = lines.slice(
+    Math.max(headLineCount, lines.length - tailLineCount),
+  );
   let omittedLines = Math.max(
     0,
     lines.length - headLines.length - tailLines.length,

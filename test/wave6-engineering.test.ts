@@ -240,8 +240,8 @@ describe("Wave 6 capability 5: Dual Direct + Code Mode (tools.harness.*) registr
 
     const doctor = OpenCodeV2Plugin.setup(ctx);
     expect(doctor.healthy).toBe(true);
-    expect(doctor.version).toBe("1.0.5");
-    expect(HARNESS_RELEASE_VERSION).toBe("1.0.5");
+    expect(doctor.version).toBe(HARNESS_RELEASE_VERSION);
+    expect(HARNESS_RELEASE_VERSION).toBe("1.0.6");
     expect(namespaces).toEqual(["harness"]);
     expect(directTools).toContain("symbol_references");
     expect(codeModeTools).toContain("symbol_references");

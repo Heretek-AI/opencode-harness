@@ -34,6 +34,7 @@ import {
 import {
   appendBlocksToToolAfterEvent,
   buildEditNearMissContext,
+  buildPostMutationAnchorReceipt,
   didToolExecutionFail,
   extractToolOutputText,
   hardenShellInvocation,
@@ -46,15 +47,20 @@ import {
   applyRootAffinityHeadersInPlace,
   calibrateSystemPromptInPlace,
   decontaminateCompactionEventInPlace,
+  handleSessionRetryInPlace,
   recordSessionParentLink,
+  type SessionRetryEvent,
 } from "../interceptors/session-interceptors.js";
 import {
   evaluateContractChangeImpact,
   runArchitectureAudit,
 } from "../verify/architecture-advisor.js";
+import { trackCircuitBreakerAndAutoProposeLesson } from "../context/episodic-memory.js";
 import { buildRepoMap, extractOutline } from "../repomap/repomap.js";
 import { getRecommendedMcpConfig } from "../ui-auditor/mcp-defaults.js";
 import type { ToolDefinition } from "../index.js";
+
+export type { SessionRetryEvent as OpenCodeV2SessionRetryEvent } from "../interceptors/session-interceptors.js";
 
 export interface OpenCodeV2ToolEditor {
   namespace?: (ns: { name: string; description?: string }) => void;
@@ -207,7 +213,8 @@ export interface OpenCodeV2PromiseContext {
         | "context"
         | "compaction"
         | "generate"
-        | "model.request",
+        | "model.request"
+        | "retry",
       handler: (ev: any) => void | Promise<void>,
     ) => void;
     synthetic?: (input: { sessionID: string; text: string }) => Promise<unknown>;
@@ -256,6 +263,7 @@ const MUTATING_FILE_TOOLS = new Set([
   "multiedit",
   "file_hash_edit",
   "ast_structural_rewrite",
+  "rename_symbol",
 ]);
 
 const READ_FILE_TOOLS = new Set(["read", "file_hash_read"]);
@@ -267,6 +275,7 @@ const CODEMODE_PINNED_TOOLS = new Set([
   "blast_radius",
   "file_outline",
   "symbol_references",
+  "rename_symbol",
   "architecture_audit",
 ]);
 
@@ -315,6 +324,7 @@ export function inspectHostContract(
       "edit-line-prefix-and-indentation-auto-repair",
       "patch-envelope-and-line-prefix-auto-repair",
       "edit-near-miss-hashline-anchor-recovery",
+      "post-edit-formatter-anchor-resync-receipt",
       "edit-exported-contract-impact-analyzer",
       "read-missing-path-fuzzy-resolver",
       "shell-non-interactive-env-hardener",
@@ -324,6 +334,8 @@ export function inspectHostContract(
       "meta-txt-prompt-guidance-calibrator",
       "compaction-prompt-and-tools-decontaminator",
       "multihop-root-session-affinity-propagator",
+      "session-retry-adaptive-stream-backoff",
+      "circuit-breaker-episodic-lesson-auto-proposer",
       "codemode-harness-namespace-bridge",
     ],
     healthy,
@@ -383,7 +395,7 @@ export function wireOpenCodeV2PromiseContext(params: {
         editor.namespace({
           name: "harness",
           description:
-            "In-process repository intelligence, hash-anchored file reads, symbol reference search, blast-radius analysis, and architecture auditing for batched Code Mode scripts.",
+            "In-process repository intelligence, hash-anchored file reads, symbol reference search, atomic multi-file rename, blast-radius analysis, and architecture auditing for batched Code Mode scripts.",
         });
         for (const [name, def] of Object.entries(tools)) {
           if (!CODEMODE_PINNED_TOOLS.has(name)) continue;
@@ -442,7 +454,7 @@ export function wireOpenCodeV2PromiseContext(params: {
           const rep = inspectHostContract(
             ctx,
             "@heretek-ai/opencode-harness",
-            "1.0.5",
+            "1.0.6",
             workspaceRoot,
             toolNames,
           );
@@ -457,7 +469,7 @@ export function wireOpenCodeV2PromiseContext(params: {
       editor.add({
         name: "audit",
         description:
-          "Run a repository-wide circular dependency and engineering quality audit.",
+          "Run a repository-wide circular dependency, unused export, and engineering quality audit.",
         execute: async (input) => {
           const audit = runArchitectureAudit(workspaceRoot);
           if (typeof ctx.session?.synthetic === "function") {
@@ -642,22 +654,34 @@ export function wireOpenCodeV2PromiseContext(params: {
 
           if (ok && targets.length > 0) {
             for (const target of targets) {
+              recordFileReadTimestamp(sessionId, target, workspaceRoot);
               const diag = collectFileDiagnostics(target, workspaceRoot);
               if (!diag.clean && diag.formattedTag) {
                 appendedBlocks.push(diag.formattedTag);
               }
               const beforeText = preContents?.get(target);
-              if (beforeText !== undefined && existsSync(target)) {
+              if (existsSync(target)) {
                 try {
                   const afterText = readFileSync(target, "utf8");
-                  const impact = evaluateContractChangeImpact({
+                  const anchorReceipt = buildPostMutationAnchorReceipt({
                     filePath: target,
                     beforeContent: beforeText,
                     afterContent: afterText,
-                    rootDir: workspaceRoot,
+                    workspaceRoot,
                   });
-                  if (impact && impact.formattedTag) {
-                    appendedBlocks.push(impact.formattedTag);
+                  if (anchorReceipt) {
+                    appendedBlocks.push(anchorReceipt);
+                  }
+                  if (beforeText !== undefined) {
+                    const impact = evaluateContractChangeImpact({
+                      filePath: target,
+                      beforeContent: beforeText,
+                      afterContent: afterText,
+                      rootDir: workspaceRoot,
+                    });
+                    if (impact && impact.formattedTag) {
+                      appendedBlocks.push(impact.formattedTag);
+                    }
                   }
                 } catch (err) {
                   if (err) continue;
@@ -751,12 +775,26 @@ export function wireOpenCodeV2PromiseContext(params: {
           appendedBlocks.push(cbVerdict.directive);
         }
 
+        const autoLesson = trackCircuitBreakerAndAutoProposeLesson({
+          sessionId,
+          toolName,
+          ok,
+          tripped: cbVerdict.tripped,
+          targetPathOrCommand: primaryPath ?? command,
+          workspaceRoot,
+        });
+        if (autoLesson) {
+          appendedBlocks.push(
+            `<episodic-recovery-lesson id="${autoLesson.id}" scope="${autoLesson.scopePrefix ?? ""}">${autoLesson.proposedSummary}</episodic-recovery-lesson>`,
+          );
+        }
+
         appendBlocksToToolAfterEvent(event, appendedBlocks);
       },
     );
   }
 
-  // 8. Wire `session.hook` (`prompt`, `context`, `generate`, `compaction`, `model.request`)
+  // 8. Wire `session.hook` (`prompt`, `context`, `generate`, `compaction`, `model.request`, `retry`)
   if (typeof ctx.session?.hook === "function") {
     ctx.session.hook("prompt", (event: OpenCodeV2SessionPromptEvent) => {
       if (isCompactionAgent(event.agent)) {
@@ -861,12 +899,16 @@ export function wireOpenCodeV2PromiseContext(params: {
         applyRootAffinityHeadersInPlace(event);
       },
     );
+
+    ctx.session.hook("retry", (event: SessionRetryEvent) => {
+      handleSessionRetryInPlace(event);
+    });
   }
 
   return inspectHostContract(
     ctx,
     "@heretek-ai/opencode-harness",
-    "1.0.5",
+    "1.0.6",
     workspaceRoot,
     toolNames,
   );
