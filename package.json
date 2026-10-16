@@ -1,6 +1,6 @@
 {
   "name": "@heretek-ai/opencode-harness",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lean OpenCode v2 in-process harness plugin: Hashline edits, AST codemods, KV-cache-safe context budgeting, permission guards, and DOM geometry auditing.",
   "license": "MIT",
   "repository": {
