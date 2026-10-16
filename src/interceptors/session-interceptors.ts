@@ -32,6 +32,14 @@ import { buildMuseSystemOverlay } from "../muse/muse-calibration.js";
 const META_SUBAGENT_OVERTRIGGER =
   "- Use the `subagent` tool to minimize context token usage whenever tool calls generate large outputs but only a small subset is useful for the task at hand. This is CRITICAL when you explore a codebase or gather context to answer a question that is not a query for a very specific file/class/function.";
 
+/**
+ * Fallback matcher for the same `meta.txt` bullet if upstream rewords it: any
+ * single bullet line telling the model to use `subagent` to save context
+ * tokens. Deliberately one line (`[^\n]*`) so nothing else is touched.
+ */
+const META_SUBAGENT_OVERTRIGGER_LINE =
+  /^- [^\n]*`subagent` tool[^\n]*context token usage[^\n]*$/m;
+
 const CALIBRATED_SUBAGENT_RULE =
   "- Perform routine file reads (`read`, `file_hash_read`, `file_outline`), targeted searches (`grep`, `glob`, `ast_structural_search`, `symbol_references`), and dependency checks (`repo_map`, `blast_radius`) directly in the main context. Only spawn a `subagent` when broad exploration spans more than 8 files or when executing independent parallel workstreams.";
 
@@ -55,6 +63,11 @@ export function calibrateSystemPromptInPlace(
     let text = first.text;
     if (text.includes(META_SUBAGENT_OVERTRIGGER)) {
       text = text.replace(META_SUBAGENT_OVERTRIGGER, CALIBRATED_SUBAGENT_RULE);
+      modified = true;
+    } else if (META_SUBAGENT_OVERTRIGGER_LINE.test(text)) {
+      // Upstream reworded the sentence: still replace the whole bullet line so
+      // the calibration does not silently become a no-op.
+      text = text.replace(META_SUBAGENT_OVERTRIGGER_LINE, CALIBRATED_SUBAGENT_RULE);
       modified = true;
     }
     const overlay = buildMuseSystemOverlay();

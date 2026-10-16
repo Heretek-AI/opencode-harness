@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import OpenCodeV2Plugin, {
+  setupOpenCodeV2Harness,
   buildPostMutationAnchorReceipt,
   clearAllSessionAttempts,
   clearDiagnosticsCache,
@@ -22,6 +23,8 @@ import OpenCodeV2Plugin, {
   type OpenCodeV2ToolAfterEvent,
   type OpenCodeV2ToolBeforeEvent,
 } from "../src/index";
+import pkgJson from "../package.json";
+const PKG_VERSION: string = pkgJson.version;
 
 let tempDirs: string[] = [];
 
@@ -280,10 +283,10 @@ describe("Wave 7 capability 5: automatic circuit-breaker recovery lesson synthes
       },
     };
 
-    const doctor = OpenCodeV2Plugin.setup(ctx);
+    const doctor = setupOpenCodeV2Harness(ctx).report;
     expect(doctor.healthy).toBe(true);
-    expect(doctor.version).toBe("1.0.6");
-    expect(HARNESS_RELEASE_VERSION).toBe("1.0.6");
+    expect(doctor.version).toBe(HARNESS_RELEASE_VERSION);
+    expect(HARNESS_RELEASE_VERSION).toBe(PKG_VERSION);
     expect(directTools).toContain("rename_symbol");
     expect(codeModeTools).toContain("rename_symbol");
 

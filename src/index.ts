@@ -67,6 +67,7 @@ import { runIncrementalVerification } from "./verify/verifier.js";
 import { runArchitectureAudit } from "./verify/architecture-advisor.js";
 import {
   wireOpenCodeV2PromiseContext,
+  type DoctorReport,
   type OpenCodeV2PromiseContext,
 } from "./host/contract-adapter.js";
 
@@ -89,6 +90,7 @@ export * from "./muse/muse-calibration.js";
 export * from "./interceptors/tool-interceptors.js";
 export * from "./interceptors/session-interceptors.js";
 export * from "./host/contract-adapter.js";
+import { HARNESS_VERSION } from "./version.js";
 // Explicit re-export: both `./editors/hashline-tools.js` and
 // `./interceptors/tool-interceptors.js` export `computeLineHash`, so the
 // bare `export *` pair would leave the name ambiguous (and unexported).
@@ -101,8 +103,7 @@ export type {
 } from "./ui-auditor/mcp-defaults.js";
 
 export const HARNESS_NAME = "@heretek-ai/opencode-harness";
-export const HARNESS_VERSION = "1.0.0";
-export const HARNESS_RELEASE_VERSION = "1.0.6";
+export { HARNESS_RELEASE_VERSION, HARNESS_VERSION } from "./version.js";
 
 export const HARNESS_TOOL_NAMES = [
   "file_hash_read",
@@ -215,6 +216,8 @@ export interface HarnessPluginOptions {
   taskMd?: string;
   planMd?: string;
   lessons?: LessonInput[];
+  /** Opt-in seeding of the recommended MCP servers (default false). */
+  seedRecommendedMcp?: boolean;
 }
 
 export interface ResolvedHarnessOptions {
@@ -224,6 +227,7 @@ export interface ResolvedHarnessOptions {
   taskMd?: string;
   planMd?: string;
   lessons?: LessonInput[];
+  seedRecommendedMcp: boolean;
 }
 
 export interface HarnessPlugin {
@@ -299,10 +303,19 @@ export function resolveHarnessOptions(
       "opencode-harness: lessons must be an array when present (fail-closed)",
     );
   }
+  if (
+    settings.seedRecommendedMcp !== undefined &&
+    typeof settings.seedRecommendedMcp !== "boolean"
+  ) {
+    throw new Error(
+      "opencode-harness: seedRecommendedMcp must be a boolean when present (fail-closed)",
+    );
+  }
   return {
     rootDir,
     guardConfig,
     contextBudgetTokens: Math.floor(budget as number),
+    seedRecommendedMcp: settings.seedRecommendedMcp === true,
     ...(settings.taskMd !== undefined ? { taskMd: settings.taskMd } : {}),
     ...(settings.planMd !== undefined ? { planMd: settings.planMd } : {}),
     ...(settings.lessons !== undefined ? { lessons: settings.lessons } : {}),
@@ -900,57 +913,138 @@ function discoverOptionalWorkspaceFile(
 }
 
 /**
+ * Wraps a host context so every `hook(...)` / `transform(...)` registration
+ * the harness makes is collected. Real OpenCode V2 domains return
+ * `Promise<Registration>`; older/fake hosts may return nothing.
+ */
+function trackHostRegistrations(
+  ctx: OpenCodeV2PromiseContext,
+  registrations: unknown[],
+): OpenCodeV2PromiseContext {
+  const domains = ["tool", "permission", "session", "shell", "agent", "command", "mcp"] as const;
+  const tracked: Record<string, unknown> = { ...ctx };
+  for (const name of domains) {
+    const domain = (ctx as Record<string, unknown>)[name];
+    if (domain === null || typeof domain !== "object") continue;
+    tracked[name] = new Proxy(domain as object, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if ((prop === "hook" || prop === "transform") && typeof value === "function") {
+          return (...args: unknown[]) => {
+            const result = (value as (...a: unknown[]) => unknown).apply(target, args);
+            registrations.push(result);
+            return result;
+          };
+        }
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+  return tracked as OpenCodeV2PromiseContext;
+}
+
+async function disposeRegistrations(registrations: unknown[]): Promise<void> {
+  const settled = await Promise.allSettled(registrations.map((r) => Promise.resolve(r)));
+  for (const outcome of settled) {
+    if (outcome.status !== "fulfilled") continue;
+    const reg = outcome.value as { dispose?: () => unknown } | undefined;
+    if (reg && typeof reg.dispose === "function") {
+      await reg.dispose();
+    }
+  }
+}
+
+export interface OpenCodeV2SetupResult {
+  report: DoctorReport;
+  /** Resolves once every host registration has been accepted. */
+  ready: Promise<void>;
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Wire the harness into an OpenCode V2 promise context and return the
+ * `/doctor` report plus registration lifecycle handles. `OpenCodeV2Plugin.setup`
+ * is the host-facing wrapper around this.
+ */
+export function setupOpenCodeV2Harness(
+  ctx: OpenCodeV2PromiseContext,
+  options?: HarnessPluginOptions,
+): OpenCodeV2SetupResult {
+  const hostOptions =
+    ctx?.options !== null && typeof ctx?.options === "object"
+      ? (ctx.options as HarnessPluginOptions)
+      : undefined;
+  const merged: HarnessPluginOptions = { ...hostOptions, ...options };
+  const inferredRoot =
+    ctx?.directory ??
+    ctx?.worktree ??
+    ctx?.location?.directory ??
+    ctx?.location?.worktree ??
+    process.cwd();
+  const resolved = resolveHarnessOptions({
+    rootDir: inferredRoot,
+    ...merged,
+  });
+  const tools = buildExtendedHarnessTools(resolved);
+  const registrations: unknown[] = [];
+  const report = wireOpenCodeV2PromiseContext({
+    ctx: trackHostRegistrations(ctx, registrations),
+    workspaceRoot: resolved.rootDir,
+    tools,
+    seedRecommendedMcp: resolved.seedRecommendedMcp,
+    evaluatePermission: (req) => evaluateBoardGuard(req, resolved.guardConfig),
+    recordCircuitBreaker: (ev) => {
+      const verdict = recordAndEvaluateCircuitBreaker(ev);
+      return toTrippedDirective(verdict);
+    },
+    runContextBudget: (ev) => {
+      const taskMd =
+        resolved.taskMd ??
+        discoverOptionalWorkspaceFile(resolved.rootDir, [
+          "TASK.md",
+          ".opencode/task.md",
+        ]);
+      const planMd =
+        resolved.planMd ??
+        discoverOptionalWorkspaceFile(resolved.rootDir, [
+          "PLAN.md",
+          ".opencode/plan.md",
+        ]);
+      registerContextBudgetHook(ev, {
+        rootDir: resolved.rootDir,
+        budgetTokens: resolved.contextBudgetTokens,
+        ...(taskMd !== undefined ? { taskMd } : {}),
+        ...(planMd !== undefined ? { planMd } : {}),
+        ...(resolved.lessons !== undefined ? { lessons: resolved.lessons } : {}),
+      });
+    },
+  });
+  const ready = Promise.all(registrations.map((r) => Promise.resolve(r))).then(
+    () => undefined,
+  );
+  return {
+    report,
+    ready,
+    dispose: () => disposeRegistrations(registrations),
+  };
+}
+
+/**
  * Native OpenCode V2 `PluginModule` default export (`{ id, setup(ctx) }`)
- * consumed by `packages/core/src/plugin/module.ts`.
+ * consumed by `packages/core/src/plugin/module.ts`. `setup` waits for every
+ * registration and returns the cleanup function the host calls on unload
+ * (the host treats any returned value as a cleanup callback). Plugin options
+ * from `opencode.json` arrive on `ctx.options`.
  */
 export const OpenCodeV2Plugin = {
   id: HARNESS_NAME,
-  setup(ctx: OpenCodeV2PromiseContext, options?: HarnessPluginOptions) {
-    const inferredRoot =
-      ctx?.directory ??
-      ctx?.worktree ??
-      ctx?.location?.directory ??
-      ctx?.location?.worktree ??
-      process.cwd();
-    const resolved = resolveHarnessOptions({
-      rootDir: inferredRoot,
-      ...options,
-    });
-    const tools = buildExtendedHarnessTools(resolved);
-    return wireOpenCodeV2PromiseContext({
-      ctx,
-      workspaceRoot: resolved.rootDir,
-      tools,
-      evaluatePermission: (req) =>
-        evaluateBoardGuard(req, resolved.guardConfig),
-      recordCircuitBreaker: (ev) => {
-        const verdict = recordAndEvaluateCircuitBreaker(ev);
-        return toTrippedDirective(verdict);
-      },
-      runContextBudget: (ev) => {
-        const taskMd =
-          resolved.taskMd ??
-          discoverOptionalWorkspaceFile(resolved.rootDir, [
-            "TASK.md",
-            ".opencode/task.md",
-          ]);
-        const planMd =
-          resolved.planMd ??
-          discoverOptionalWorkspaceFile(resolved.rootDir, [
-            "PLAN.md",
-            ".opencode/plan.md",
-          ]);
-        registerContextBudgetHook(ev, {
-          rootDir: resolved.rootDir,
-          budgetTokens: resolved.contextBudgetTokens,
-          ...(taskMd !== undefined ? { taskMd } : {}),
-          ...(planMd !== undefined ? { planMd } : {}),
-          ...(resolved.lessons !== undefined
-            ? { lessons: resolved.lessons }
-            : {}),
-        });
-      },
-    });
+  async setup(
+    ctx: OpenCodeV2PromiseContext,
+    options?: HarnessPluginOptions,
+  ): Promise<() => Promise<void>> {
+    const { ready, dispose } = setupOpenCodeV2Harness(ctx, options);
+    await ready;
+    return dispose;
   },
 };
 

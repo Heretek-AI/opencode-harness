@@ -53,6 +53,8 @@ import {
   type ToolAfterHandler,
   type ToolDefinition,
 } from "../src/index";
+import pkgJson from "../package.json";
+const PKG_VERSION: string = pkgJson.version;
 
 let roots: string[] = [];
 
@@ -133,7 +135,7 @@ afterEach(async () => {
 describe("plugin identity", () => {
   test("exposes the published package identity", () => {
     expect(HARNESS_NAME).toBe("@heretek-ai/opencode-harness");
-    expect(HARNESS_VERSION).toBe("1.0.0");
+    expect(HARNESS_VERSION).toBe(PKG_VERSION);
   });
 
   test("declares exactly the five SPEC tool names", () => {

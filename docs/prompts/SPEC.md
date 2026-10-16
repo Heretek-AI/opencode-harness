@@ -163,6 +163,7 @@ Implement the exact upgraded Doom-Loop Circuit Breaker from Report `01b` §9.2:
   - `injectContextBudgetIntoMessages(event: { agent?: string; kind?: string; system?: Array<{ text: string }>; messages?: Array<{ role: string; content: any }> }, packedText: string): void`
 - **NON-NEGOTIABLE KV-CACHE INVARIANTS (Tested by `test/context-budget.test.ts`):**
   1. `injectContextBudgetIntoMessages` MUST **NEVER** mutate `event.system`! `event.system` must remain bit-for-bit identical before and after the hook runs so DeepSeek, Anthropic, and OpenCode Go KV prefix caches stay at >90% hit rate.
+     - *Amendment (v1.0.4+, documented in README "KV-cache note"):* this invariant binds `injectContextBudgetIntoMessages`, which still never touches `event.system`. The separate Muse calibration hook (`calibrateSystemPromptInPlace`) intentionally rewrites `event.system[0]` with a turn-invariant result, so prefix caches still hit.
   2. Dynamic context (`<opencode-harness-context>...</opencode-harness-context>`) MUST be appended strictly to the **last message where `role === "user"`** in `event.messages`.
   3. Episodic lessons MUST be sorted deterministically by `a.id.localeCompare(b.id)` and formatted as `<episodic-repository-memory id="${l.id}">\n- (${l.trigger}): ${l.lesson}\n</episodic-repository-memory>` with **ZERO floating-point relevance scores or timestamps** in the tag attributes.
 
