@@ -945,10 +945,12 @@ function trackHostRegistrations(
 
 async function disposeRegistrations(registrations: unknown[]): Promise<void> {
   const settled = await Promise.allSettled(registrations.map((r) => Promise.resolve(r)));
-  const disposals = settled.map((outcome) => {
-    if (outcome.status !== "fulfilled") return undefined;
+  // async wrapper turns a synchronous throw from one dispose() into a rejection,
+  // so it cannot stop the remaining registrations from being disposed.
+  const disposals = settled.map(async (outcome) => {
+    if (outcome.status !== "fulfilled") return;
     const reg = outcome.value as { dispose?: () => unknown } | undefined;
-    return reg && typeof reg.dispose === "function" ? reg.dispose() : undefined;
+    if (reg && typeof reg.dispose === "function") await reg.dispose();
   });
   await Promise.allSettled(disposals);
 }
