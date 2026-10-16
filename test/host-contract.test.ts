@@ -164,7 +164,7 @@ describe("Muse 1.3 system prompt calibration option", () => {
   });
 
   test("rejects a non-boolean museCalibration", async () => {
-    expect(promptHandlers({ museCalibration: "yes" })).rejects.toThrow(/museCalibration/);
+    await expect(promptHandlers({ museCalibration: "yes" })).rejects.toThrow(/museCalibration/);
   });
 });
 
