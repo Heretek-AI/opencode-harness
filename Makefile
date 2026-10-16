@@ -11,7 +11,8 @@ accept:
 	@if [ -z "$(WAVE)" ]; then \
 		bash scripts/accept/wave-1.sh && \
 		bash scripts/accept/wave-2.sh && \
-		bash scripts/accept/wave-3.sh; \
+		bash scripts/accept/wave-3.sh && \
+		bash scripts/accept/wave-4.sh; \
 	else \
 		bash scripts/accept/wave-$(WAVE).sh; \
 	fi

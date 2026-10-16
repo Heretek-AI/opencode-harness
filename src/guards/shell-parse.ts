@@ -1,17 +1,7 @@
 /**
- * `src/guards/shell-parse.ts` — Salvaged AST/token shell command classifier.
- *
- * Wave 1 module per `docs/prompts/SPEC.md` Section 2.3 C. Decoupled from
- * `OrgBoard`: a pure, dependency-free classifier that labels shell commands
- * as `read-only`, `write` (file-mutating), or `destructive`.
- *
- * - Destructive covers SPEC Rule 1: `rm -rf /`, `rm -rf *`,
- *   `git reset --hard`, `git push --force`, `mkfs`, `dd if=`
- *   (plus flag-order/`sudo` variants of the same operations).
- * - Write covers file-mutating shell: redirections, mutating file verbs,
- *   mutating `git` subcommands, and package installs.
- * - Everything else (listing, inspection, verification commands such as
- *   `bun test`, `make check`, `git status`) is read-only.
+ * `src/guards/shell-parse.ts` — Salvaged AST/token shell command classifier
+ * upgraded with quote-aware POSIX tokenization and recursive unwrapping of
+ * subshells (`bash -c "..."`, `sh -c "..."`, `eval "..."`, `xargs`, `$(...)`).
  */
 
 export type ShellCommandClass = "read-only" | "write" | "destructive";
@@ -22,7 +12,235 @@ export interface ParsedShellCommand {
   targets: string[];
 }
 
+export interface ParsedSegment {
+  raw: string;
+  tokens: string[];
+  envVars: Record<string, string>;
+  executable: string;
+  args: string[];
+}
+
+const SHELL_OPERATORS = new Set(["&&", "||", ";", "|", "&"]);
 const CHAIN_SEPARATOR = /&&|\|\||;;|[;\n]+|\|(?!\|)/;
+
+export function splitShellPipeline(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+  let parenDepth = 0;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      current += ch;
+      continue;
+    }
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      }
+      current += ch;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+
+    if (ch === "(") {
+      parenDepth += 1;
+      current += ch;
+      continue;
+    }
+
+    if (ch === ")" && parenDepth > 0) {
+      parenDepth -= 1;
+      current += ch;
+      continue;
+    }
+
+    if (parenDepth === 0) {
+      if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+
+      if (ch === ";" || ch === "|" || ch === "&" || ch === "\n") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        continue;
+      }
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    segments.push(current.trim());
+  }
+
+  return segments;
+}
+
+export function tokenizeSegment(segment: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += ch;
+  }
+
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+
+  return tokens.filter((t) => !SHELL_OPERATORS.has(t));
+}
+
+const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+const WRAPPER_BINARIES = new Set(["sudo", "env", "command", "nohup", "time", "nice"]);
+const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+
+function extractInlineSubstitutions(raw: string): string[] {
+  const extracted: string[] = [];
+  const dollarParenRe = /\$\(([^()]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = dollarParenRe.exec(raw)) !== null) {
+    if (m[1]?.trim()) extracted.push(m[1].trim());
+  }
+  const backtickRe = /`([^`]+)`/g;
+  while ((m = backtickRe.exec(raw)) !== null) {
+    if (m[1]?.trim()) extracted.push(m[1].trim());
+  }
+  return extracted;
+}
+
+function parseSingleSegment(raw: string): ParsedSegment | null {
+  const trimmed = raw.trim().replace(/^\(+|\)+$/g, "").trim();
+  if (!trimmed) return null;
+  const tokens = tokenizeSegment(trimmed);
+  if (tokens.length === 0) return null;
+
+  const envVars: Record<string, string> = {};
+  let idx = 0;
+
+  while (idx < tokens.length) {
+    const token = tokens[idx];
+    const envMatch = ENV_ASSIGNMENT_RE.exec(token);
+    if (envMatch) {
+      envVars[envMatch[1]] = envMatch[2];
+      idx++;
+      continue;
+    }
+
+    if (WRAPPER_BINARIES.has(token)) {
+      idx++;
+      while (idx < tokens.length && tokens[idx].startsWith("-")) {
+        idx++;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  const executable = tokens[idx] ?? "";
+  const args = tokens.slice(idx + 1);
+
+  return {
+    raw: trimmed,
+    tokens,
+    envVars,
+    executable,
+    args,
+  };
+}
+
+export function parseCommandSegments(command: string, depth: number = 0): ParsedSegment[] {
+  if (depth > 4 || !command.trim()) return [];
+  const rawSegments = splitShellPipeline(command);
+  const parsed: ParsedSegment[] = [];
+
+  for (const raw of rawSegments) {
+    const seg = parseSingleSegment(raw);
+    if (!seg) continue;
+    parsed.push(seg);
+
+    const baseExe = seg.executable.split("/").pop() ?? seg.executable;
+
+    if (SHELL_INTERPRETERS.has(baseExe)) {
+      const cIdx = seg.args.findIndex((a) => a === "-c" || a === "-lc" || a === "-ec");
+      if (cIdx >= 0 && seg.args[cIdx + 1]) {
+        parsed.push(...parseCommandSegments(seg.args[cIdx + 1], depth + 1));
+      }
+    } else if (baseExe === "eval" && seg.args.length > 0) {
+      parsed.push(...parseCommandSegments(seg.args.join(" "), depth + 1));
+    } else if (baseExe === "xargs" && seg.args.length > 0) {
+      const targetArgs = seg.args.filter((a) => !a.startsWith("-"));
+      if (targetArgs.length > 0) {
+        parsed.push(...parseCommandSegments(targetArgs.join(" "), depth + 1));
+      }
+    }
+
+    for (const sub of extractInlineSubstitutions(raw)) {
+      parsed.push(...parseCommandSegments(sub, depth + 1));
+    }
+  }
+
+  return parsed;
+}
 
 function stripSudoPrefix(segment: string): string {
   let rest = segment.trim();
@@ -224,21 +442,24 @@ function segmentIsWrite(segment: string): boolean {
 
 /**
  * Classify a shell command string. Multi-command chains (`&&`, `;`, `||`,
- * pipes, newlines) resolve to the most severe class of any segment:
- * `destructive` beats `write` beats `read-only`. Empty input is read-only
- * (a no-op). Targets lists the leading tokens of mutating segments for
- * audit logging.
+ * pipes, newlines) and recursively unwrapped subshells (`bash -c`, `eval`, `$(...)`)
+ * resolve to the most severe class of any segment:
+ * `destructive` beats `write` beats `read-only`.
  */
 export function classifyShellCommand(command: string): ParsedShellCommand {
   const raw = typeof command === "string" ? command : "";
   const segments = splitChain(raw);
+  const unwrapped = parseCommandSegments(raw).map((s) => `${s.executable} ${s.args.join(" ")}`.trim());
+  const allCandidates = [...segments, ...unwrapped];
   const targets: string[] = [];
   let sawWrite = false;
-  for (const segment of segments) {
+  for (const segment of allCandidates) {
     if (segmentIsDestructive(segment)) {
       targets.push(stripSudoPrefix(segment));
       return { raw, class: "destructive", targets };
     }
+  }
+  for (const segment of segments) {
     if (segmentIsWrite(segment)) {
       sawWrite = true;
       targets.push(stripSudoPrefix(segment));
