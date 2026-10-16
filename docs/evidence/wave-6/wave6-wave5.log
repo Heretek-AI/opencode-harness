@@ -1,0 +1,67 @@
+ok: bun run check (tsc --noEmit)
+ok: bun test (full suite incl. plugin-interceptors)
+ok: bun test test/plugin-interceptors.test.ts (10 interceptor tests)
+ok: wave-1 regression
+ok: wave-2 regression
+ok: wave-3 regression
+ok: wave-4 regression
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: repairEditToolInputInPlace
+ok: export present: buildEditNearMissContext
+ok: export present: resolveMissingReadPath
+ok: export present: hardenShellInvocation
+ok: export present: didToolExecutionFail
+ok: export present: extractToolOutputText
+ok: export present: appendBlocksToToolAfterEvent
+ok: export present: normalizePluginToolResult
+ok: export present: calibrateSystemPromptInPlace
+ok: export present: decontaminateCompactionEventInPlace
+ok: export present: recordSessionParentLink
+ok: export present: resolveRootSessionAffinity
+ok: export present: clearSessionLineage
+ok: export present: applyRootAffinityHeadersInPlace
+ok: export present: detectCircularDependencies
+ok: export present: evaluateContractChangeImpact
+ok: export present: scanFileEngineeringQuality
+ok: export present: runArchitectureAudit
+ok: export present: architecture_audit
+ok: export present: HARNESS_RELEASE_VERSION
+ok: export present: toTrippedDirective
+ok: wired into index: interceptors/tool-interceptors
+ok: wired into index: interceptors/session-interceptors
+ok: wired into index: verify/architecture-advisor
+ok: core surface preserved: HARNESS_TOOL_NAMES
+ok: core surface preserved: file_hash_read
+ok: core surface preserved: file_hash_edit
+ok: core surface preserved: ast_structural_search
+ok: core surface preserved: ast_structural_rewrite
+ok: core surface preserved: ui_geometry_audit
+ok: core surface preserved: permission.hook
+ok: core surface preserved: tool.execute.after
+ok: core surface preserved: session.hook
+ok: core surface preserved: getRecommendedMcpConfig
+ok: core surface preserved: injectContextBudgetIntoMessages
+ok: core surface preserved: lsp-mcp-server
+ok: core surface preserved: fallow-mcp
+mcp config exact: lsp-mcp-server + fallow-mcp
+ok: getRecommendedMcpConfig exact shape (bunx + npx fallow)
+ok: extended surface present: EXTENDED_HARNESS_TOOL_NAMES
+ok: extended surface present: repo_map
+ok: extended surface present: blast_radius
+ok: extended surface present: file_outline
+ok: extended surface present: verify_scoped
+ok: extended surface present: architecture_audit
+ok: extended surface present: checkpoint_create
+ok: extended surface present: checkpoint_rollback
+ok: wave-4 fix preserved: verdict.triggered
+ok: wave-4 fix preserved: verdict.intervention
+ok: wave-4 fix preserved: non-string user content (fail-closed)
+ok: wave-4 fix preserved: context-budget.js
+ok: wave-4 fix preserved: repomap.js
+ok: wave-4 fix preserved: interface EpisodicLesson
+ok: all relative imports use .js extensions
+ok: canonical EpisodicLesson defined exactly once (context-budget)
+ok: scope refusal scan (single-session plugin only)
+ok: scope refusal scan (wave-5.sh clean)
+ok: upstream scripts documented reference-only
+WAVE 5 ACCEPT: ALL GATES GREEN

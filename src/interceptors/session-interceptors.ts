@@ -3,7 +3,8 @@
  * compaction, and root-affinity interceptors for OpenCode V2 (`opencode-2`).
  *
  * Eliminates the need to patch `packages/core/src/plugin/optimize.ts`,
- * `packages/core/src/plugin/identity.ts`, `packages/core/src/plugin/system-prompt/meta.txt`,
+ * `packages/core/src/plugin/identity.ts`, `packages/core/src/tool/plugin/opencode.ts`,
+ * `packages/core/src/plugin/system-prompt/meta.txt`,
  * `packages/core/src/session/compaction.ts`, or `packages/core/src/session/affinity.ts`
  * by running directly inside OpenCode V2's plugin hooks after built-in plugins:
  *
@@ -12,8 +13,9 @@
  *    and appends static Muse 1.3 tool guidance to `event.system[0]` without disturbing
  *    KV-cache determinism.
  * 2. `decontaminateCompactionEventInPlace`: Runs in `session.hook("compaction")` after
- *    `OptimizePlugin` and `IdentityPlugin` to strip coding-agent system prompt blocks
- *    and tool definitions that were erroneously injected into the compaction request.
+ *    `OptimizePlugin`, `IdentityPlugin`, and `OpenCodeTools.Plugin` to strip coding-agent
+ *    system prompt blocks, `# Your Model` identity blocks, and worktree instructions
+ *    that were erroneously injected into the compaction request, and clears `event.tools`.
  * 3. `SessionLineageTracker`: Tracks `childSessionID -> parentSessionID` links across
  *    unlimited subagent/fork hops and rewrites `x-session-affinity` / `X-Session-Id`
  *    headers in `session.hook("model.request")` so nested subagents reuse the root
@@ -26,7 +28,7 @@ const META_SUBAGENT_OVERTRIGGER =
   "- Use the `subagent` tool to minimize context token usage whenever tool calls generate large outputs but only a small subset is useful for the task at hand. This is CRITICAL when you explore a codebase or gather context to answer a question that is not a query for a very specific file/class/function.";
 
 const CALIBRATED_SUBAGENT_RULE =
-  "- Perform routine file reads (`read`, `file_hash_read`, `file_outline`), targeted searches (`grep`, `glob`, `ast_structural_search`), and dependency checks (`repo_map`, `blast_radius`) directly in the main context. Only spawn a `subagent` when broad exploration spans more than 8 files or when executing independent parallel workstreams.";
+  "- Perform routine file reads (`read`, `file_hash_read`, `file_outline`), targeted searches (`grep`, `glob`, `ast_structural_search`, `symbol_references`), and dependency checks (`repo_map`, `blast_radius`) directly in the main context. Only spawn a `subagent` when broad exploration spans more than 8 files or when executing independent parallel workstreams.";
 
 /**
  * Repairs `event.system[0]` in-place during `session.hook("context")` and
@@ -64,10 +66,10 @@ export function calibrateSystemPromptInPlace(
 }
 
 /**
- * Strips coding-agent prompt contamination and `# Your Model` identity blocks
- * that `OptimizePlugin` and `IdentityPlugin` inject into `session.hook("compaction")`,
- * and clears `event.tools` so compaction summarization requests remain pure and
- * lightweight without patching `optimize.ts` or `identity.ts`.
+ * Strips coding-agent prompt contamination, `# Your Model` identity blocks, and
+ * `OpenCodeTools.Plugin` worktree instructions that built-in plugins inject into
+ * `session.hook("compaction")`, and clears `event.tools` so compaction summarization
+ * requests remain pure and lightweight without patching upstream `opencode-2`.
  */
 export function decontaminateCompactionEventInPlace(event: {
   system?: Array<{ text: string; [k: string]: unknown }>;
@@ -84,6 +86,7 @@ export function decontaminateCompactionEventInPlace(event: {
         t.includes("You are OpenCode, a coding agent") ||
         t.includes("You are OpenCode, an interactive CLI") ||
         t.includes("<muse-1.3-harness-calibration>") ||
+        t.includes("When you create a worktree outside the current working directory") ||
         t.startsWith("# Your Model\n");
       return !isCodingPrompt;
     });
@@ -150,7 +153,6 @@ export function applyRootAffinityHeadersInPlace(event: {
     return undefined;
   }
 
-  // Record parent link if OpenCode V2 populated x-opencode-parent-session-id
   const headerParent =
     event.headers["x-opencode-parent-session-id"] ??
     event.headers["x-parent-session-id"];

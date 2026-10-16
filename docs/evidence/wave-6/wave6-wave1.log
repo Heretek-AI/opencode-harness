@@ -1,0 +1,16 @@
+ok: bun run check (tsc --noEmit)
+ok: bun test (editors, guards, circuit-breaker, bootstrap)
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: computeLineHash
+ok: export present: hashReadFile
+ok: export present: hashEditFile
+ok: export present: astSearch
+ok: export present: astRewriteFile
+ok: export present: classifyShellCommand
+ok: export present: evaluateBoardGuard
+ok: export present: recordToolAttempt
+ok: export present: sessionAttempts
+ok: export present: shouldEscalateModel
+ok: export present: circuit-breaker-intervention severity
+ok: scope refusal scan (single-session plugin only)
+WAVE 1 ACCEPT: ALL GATES GREEN

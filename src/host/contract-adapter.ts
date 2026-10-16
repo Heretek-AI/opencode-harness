@@ -1,7 +1,8 @@
 /**
  * `src/host/contract-adapter.ts` — Real OpenCode V2 (`@opencode-ai/plugin` /
  * `packages/core/src/plugin/module.ts`) `PromiseContext` host adapter,
- * plugin-over-patch interceptors, and `/doctor` self-diagnostics report.
+ * plugin-over-patch interceptors, Dual Direct + Code Mode (`tools.harness.*`)
+ * tool registration, and `/doctor` self-diagnostics report.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -38,6 +39,7 @@ import {
   hardenShellInvocation,
   normalizePluginToolResult,
   repairEditToolInputInPlace,
+  repairPatchToolInputInPlace,
   resolveMissingReadPath,
 } from "../interceptors/tool-interceptors.js";
 import {
@@ -55,11 +57,17 @@ import { getRecommendedMcpConfig } from "../ui-auditor/mcp-defaults.js";
 import type { ToolDefinition } from "../index.js";
 
 export interface OpenCodeV2ToolEditor {
+  namespace?: (ns: { name: string; description?: string }) => void;
   add: (tool: {
     name: string;
     description: string;
     input: unknown;
-    options?: { codemode?: boolean; namespace?: string; permission?: string };
+    options?: {
+      codemode?: boolean;
+      namespace?: string;
+      permission?: string;
+      pinned?: boolean;
+    };
     execute: (
       args: Record<string, unknown>,
       ctx?: unknown,
@@ -252,6 +260,16 @@ const MUTATING_FILE_TOOLS = new Set([
 
 const READ_FILE_TOOLS = new Set(["read", "file_hash_read"]);
 
+const CODEMODE_PINNED_TOOLS = new Set([
+  "file_hash_read",
+  "ast_structural_search",
+  "repo_map",
+  "blast_radius",
+  "file_outline",
+  "symbol_references",
+  "architecture_audit",
+]);
+
 export function inspectHostContract(
   ctx: OpenCodeV2PromiseContext,
   pluginId: string,
@@ -287,6 +305,7 @@ export function inspectHostContract(
       "atomic-edit-transaction-rollback",
       "stale-file-read-detector",
       "post-mutation-diagnostics-runner",
+      "cross-file-import-export-contract-verifier",
       "stack-frame-fault-localizer",
       "doom-loop-circuit-breaker",
       "kv-cache-safe-context-budget",
@@ -294,15 +313,18 @@ export function inspectHostContract(
     ],
     activeInterceptors: [
       "edit-line-prefix-and-indentation-auto-repair",
+      "patch-envelope-and-line-prefix-auto-repair",
       "edit-near-miss-hashline-anchor-recovery",
       "edit-exported-contract-impact-analyzer",
       "read-missing-path-fuzzy-resolver",
       "shell-non-interactive-env-hardener",
       "shell-nonzero-exit-fault-localizer",
+      "tool-output-head-tail-anti-truncation-compactor",
       "subagent-sha256-mutation-receipt-verifier",
       "meta-txt-prompt-guidance-calibrator",
       "compaction-prompt-and-tools-decontaminator",
       "multihop-root-session-affinity-propagator",
+      "codemode-harness-namespace-bridge",
     ],
     healthy,
   };
@@ -340,7 +362,8 @@ export function wireOpenCodeV2PromiseContext(params: {
   >();
   const pendingReadSuggestions = new Map<string, string[]>();
 
-  // 1. Register direct top-level tools (`options: { codemode: false }`) with normalized Tool.Result output
+  // 1. Register direct top-level tools (`options: { codemode: false }`) AND, when the host
+  //    supports `editor.namespace`, also register `tools.harness.*` for Code Mode (`execute`).
   if (typeof ctx.tool?.transform === "function") {
     ctx.tool.transform((editor) => {
       for (const [name, def] of Object.entries(tools)) {
@@ -354,6 +377,31 @@ export function wireOpenCodeV2PromiseContext(params: {
             return normalizePluginToolResult(raw);
           },
         });
+      }
+
+      if (typeof editor.namespace === "function") {
+        editor.namespace({
+          name: "harness",
+          description:
+            "In-process repository intelligence, hash-anchored file reads, symbol reference search, blast-radius analysis, and architecture auditing for batched Code Mode scripts.",
+        });
+        for (const [name, def] of Object.entries(tools)) {
+          if (!CODEMODE_PINNED_TOOLS.has(name)) continue;
+          editor.add({
+            name,
+            description: def.description,
+            input: def.parameters,
+            options: {
+              namespace: "harness",
+              codemode: true,
+              pinned: true,
+            },
+            execute: async (args, execCtx) => {
+              const raw = await def.execute(args, execCtx as any);
+              return normalizePluginToolResult(raw);
+            },
+          });
+        }
       }
     });
   }
@@ -394,7 +442,7 @@ export function wireOpenCodeV2PromiseContext(params: {
           const rep = inspectHostContract(
             ctx,
             "@heretek-ai/opencode-harness",
-            "1.0.4",
+            "1.0.5",
             workspaceRoot,
             toolNames,
           );
@@ -478,6 +526,11 @@ export function wireOpenCodeV2PromiseContext(params: {
       // Auto-repair EditTool line-number prefixes ("12: " / "12#a3f2| ") and indentation drift in-place
       if (toolName === "edit" && event.input) {
         repairEditToolInputInPlace(event.input, workspaceRoot);
+      }
+
+      // Auto-repair PatchTool missing *** Begin/End Patch envelope and hunk line prefixes in-place
+      if (toolName === "patch" && event.input) {
+        repairPatchToolInputInPlace(event.input);
       }
 
       // Auto-resolve unambiguous missing read paths or cache suggestions for error enrichment
@@ -723,7 +776,6 @@ export function wireOpenCodeV2PromiseContext(params: {
         return;
       }
 
-      // Repair meta.txt subagent over-trigger and append static Muse 1.3 calibration in-place
       if (Array.isArray(event.system)) {
         calibrateSystemPromptInPlace(event.system);
       }
@@ -796,7 +848,6 @@ export function wireOpenCodeV2PromiseContext(params: {
     ctx.session.hook("context", handleContextOrGenerate);
     ctx.session.hook("generate", handleContextOrGenerate);
 
-    // Strip coding-agent prompt and tools contamination injected by OptimizePlugin / IdentityPlugin during compaction
     ctx.session.hook(
       "compaction",
       (event: OpenCodeV2SessionCompactionEvent) => {
@@ -804,7 +855,6 @@ export function wireOpenCodeV2PromiseContext(params: {
       },
     );
 
-    // Propagate true multi-hop root session ID to affinity headers for nested subagents
     ctx.session.hook(
       "model.request",
       (event: OpenCodeV2SessionModelRequestEvent) => {
@@ -816,7 +866,7 @@ export function wireOpenCodeV2PromiseContext(params: {
   return inspectHostContract(
     ctx,
     "@heretek-ai/opencode-harness",
-    "1.0.4",
+    "1.0.5",
     workspaceRoot,
     toolNames,
   );

@@ -10,17 +10,23 @@
  *      from `oldString`/`newString` when absent in the target file.
  *    - Resolving uniform leading indentation drift and trailing whitespace differences by
  *      snapping `oldString` to the exact verbatim slice in the file and re-indenting `newString`.
- * 2. `buildEditNearMissContext`: When `edit` still fails, locates the closest matching lines
+ * 2. `repairPatchToolInputInPlace`: Fixes `PatchTool` failures before they happen by wrapping
+ *    bare `*** Update/Add/Delete File:` hunks in `*** Begin Patch` / `*** End Patch` and
+ *    stripping accidental `12: ` / `12#a3f2| ` line prefixes inside hunk lines.
+ * 3. `buildEditNearMissContext`: When `edit` still fails, locates the closest matching lines
  *    in the target file and returns a 4-hex FNV-1a hash-anchored `<near-miss-anchor>` slice so
  *    Muse 1.3 can immediately apply `file_hash_edit` without an extra `read` turn.
- * 3. `resolveMissingReadPath`: When `read` targets a non-existent directory/path, searches the
+ * 4. `resolveMissingReadPath`: When `read` targets a non-existent directory/path, searches the
  *    workspace file graph for matching basenames/suffixes and either auto-resolves a unique match
  *    in `execute.before` or appends exact repo-relative path suggestions to the error.
- * 4. `hardenShellEnvironment`: Injects non-interactive environment variables (`CI=1`,
+ * 5. `hardenShellInvocation`: Injects non-interactive environment variables (`CI=1`,
  *    `GIT_TERMINAL_PROMPT=0`, `PAGER=cat`) in `shell.hook("create.before")` so commands never
  *    hang waiting for TTY input.
- * 5. `didShellToolFail` & `extractShellOutputText`: Correctly detects non-zero exit codes in
+ * 6. `didToolExecutionFail` & `extractToolOutputText`: Correctly detects non-zero exit codes in
  *    OpenCode V2's `ShellTool` (`status === "completed"` with `result.output.exit !== 0`).
+ * 7. `compactToolOutputHeadTail`: Prevents `ToolOutput.truncate` (`packages/core/src/tool-output.ts`,
+ *    which runs AFTER `execute.after` and blindly drops lines past `2,000` / `50 KiB`) from slicing
+ *    off the error tail and appended `<diagnostics>` / `<fault-context>` / `<circuit-breaker>` blocks.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -32,6 +38,13 @@ export interface EditRepairOutcome {
   strategy?: "line-prefix-stripped" | "indentation-aligned";
   oldString: string;
   newString: string;
+}
+
+export interface PatchRepairOutcome {
+  repaired: boolean;
+  addedEnvelope: boolean;
+  strippedLinePrefixes: boolean;
+  patchText: string;
 }
 
 const READ_TOOL_PREFIX_RE = /^\s*\d+:\s?/gm;
@@ -124,7 +137,6 @@ export function repairEditToolInputInPlace(
     return null;
   }
 
-  // If oldString already matches verbatim (once, or >0 with replaceAll), no repair needed
   const directMatches = countOccurrences(content, oldString);
   if (directMatches === 1 || (replaceAll && directMatches >= 1)) {
     return { repaired: false, oldString, newString };
@@ -197,7 +209,6 @@ export function repairEditToolInputInPlace(
       .slice(startIdx, startIdx + searchLines.length)
       .join("\n");
 
-    // Compute indentation delta from the first non-empty line
     let indentDelta = "";
     let stripPrefixLen = 0;
     for (let j = 0; j < searchLines.length; j++) {
@@ -257,6 +268,83 @@ export function repairEditToolInputInPlace(
   }
 
   return { repaired: false, oldString, newString };
+}
+
+/**
+ * Repairs `event.input.patchText` in-place before OpenCode V2's `PatchTool` runs:
+ * 1. Adds missing `*** Begin Patch` / `*** End Patch` wrapper markers when `patchText`
+ *    contains `*** (Update|Add|Delete) File:` headers.
+ * 2. Strips accidental `12: ` (`ReadTool`) or `12#a3f2| ` (`file_hash_read`) line
+ *    prefixes inside hunk body lines (`+`, `-`, ` `).
+ */
+export function repairPatchToolInputInPlace(
+  input: Record<string, unknown> | undefined,
+): PatchRepairOutcome | null {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    typeof input.patchText !== "string"
+  ) {
+    return null;
+  }
+
+  let text = input.patchText.trim();
+  if (!text) return null;
+
+  let addedEnvelope = false;
+  let strippedLinePrefixes = false;
+
+  const hasFileHeader =
+    /^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+/m.test(text);
+  if (hasFileHeader) {
+    if (!text.startsWith("*** Begin Patch")) {
+      text = `*** Begin Patch\n${text}`;
+      addedEnvelope = true;
+    }
+    if (!text.endsWith("*** End Patch")) {
+      text = `${text}\n*** End Patch`;
+      addedEnvelope = true;
+    }
+  }
+
+  const lines = text.split("\n");
+  const repairedLines = lines.map((line) => {
+    if (
+      line.startsWith("*** ") ||
+      line.startsWith("@@") ||
+      line.length === 0
+    ) {
+      return line;
+    }
+    const prefixChar = line[0];
+    if (prefixChar === "+" || prefixChar === "-" || prefixChar === " ") {
+      const rest = line.slice(1);
+      const hashMatch = /^\s*\d+#[0-9a-f]{4}\|\s?(.*)$/.exec(rest);
+      if (hashMatch && hashMatch[1] !== undefined) {
+        strippedLinePrefixes = true;
+        return `${prefixChar}${hashMatch[1]}`;
+      }
+      const colonMatch = /^\d+:\s(.*)$/.exec(rest);
+      if (colonMatch && colonMatch[1] !== undefined) {
+        strippedLinePrefixes = true;
+        return `${prefixChar}${colonMatch[1]}`;
+      }
+    }
+    return line;
+  });
+
+  const finalPatch = repairedLines.join("\n");
+  const repaired = addedEnvelope || strippedLinePrefixes;
+  if (repaired) {
+    input.patchText = finalPatch;
+  }
+
+  return {
+    repaired,
+    addedEnvelope,
+    strippedLinePrefixes,
+    patchText: finalPatch,
+  };
 }
 
 /**
@@ -365,12 +453,14 @@ function findWorkspaceFilesMatching(
         const rel = relative(rootDir, abs).replace(/\\/g, "/");
         const lowerBase = entry.name.toLowerCase();
         if (lowerBase === targetBase) {
-          // Higher score if suffix path segments also match
           const suffixScore = rel.toLowerCase().endsWith(normReq.toLowerCase())
             ? 100
             : 50;
           matches.push({ rel, score: suffixScore });
-        } else if (lowerBase.includes(targetBase) || targetBase.includes(lowerBase)) {
+        } else if (
+          lowerBase.includes(targetBase) ||
+          targetBase.includes(lowerBase)
+        ) {
           matches.push({ rel, score: 10 });
         }
       }
@@ -528,9 +618,69 @@ export function extractToolOutputText(event: {
 }
 
 /**
+ * Compacts oversized tool output using a head+tail window (keeping the first 35%
+ * and last 65% of lines/bytes) BEFORE OpenCode V2's `ToolOutput.truncate`
+ * (`packages/core/src/tool-output.ts`, 2,000 lines / 50 KiB) runs after `execute.after`.
+ *
+ * Without head+tail compaction, `ToolOutput.truncate` keeps only the first 50 KiB
+ * from the top of `result.content` and slices off the bottom—destroying compiler error
+ * summaries, stack traces at the end of test logs, and our appended `<diagnostics>`,
+ * `<fault-context>`, and `<circuit-breaker>` blocks.
+ */
+export function compactToolOutputHeadTail(
+  text: string,
+  maxLines: number = 1400,
+  maxBytes: number = 38_000,
+): { text: string; compacted: boolean; omittedLines: number } {
+  if (!text) return { text: "", compacted: false, omittedLines: 0 };
+
+  const byteLen = Buffer.byteLength(text, "utf8");
+  const lines = text.split("\n");
+  if (lines.length <= maxLines && byteLen <= maxBytes) {
+    return { text, compacted: false, omittedLines: 0 };
+  }
+
+  const headLineCount = Math.max(10, Math.floor(maxLines * 0.35));
+  const tailLineCount = Math.max(20, maxLines - headLineCount);
+
+  let headLines = lines.slice(0, headLineCount);
+  let tailLines = lines.slice(Math.max(headLineCount, lines.length - tailLineCount));
+  let omittedLines = Math.max(
+    0,
+    lines.length - headLines.length - tailLines.length,
+  );
+
+  const headBudget = Math.floor(maxBytes * 0.35);
+  const tailBudget = maxBytes - headBudget;
+
+  while (
+    headLines.length > 5 &&
+    Buffer.byteLength(headLines.join("\n"), "utf8") > headBudget
+  ) {
+    headLines.pop();
+    omittedLines += 1;
+  }
+
+  while (
+    tailLines.length > 5 &&
+    Buffer.byteLength(tailLines.join("\n"), "utf8") > tailBudget
+  ) {
+    tailLines.shift();
+    omittedLines += 1;
+  }
+
+  const marker = `[... ${omittedLines} middle lines compacted by opencode-harness to preserve error tail and diagnostics ...]`;
+  return {
+    text: [...headLines, marker, ...tailLines].join("\n"),
+    compacted: true,
+    omittedLines,
+  };
+}
+
+/**
  * Appends text blocks to an OpenCode V2 `ToolHooks["execute.after"]` event in-place,
- * supporting both real OpenCode V2 (`result.content` array & `error.message`) and
- * simplified string `result.output` test harnesses.
+ * applying head+tail compaction to oversized primary output so `ToolOutput.truncate`
+ * never slices off appended `<diagnostics>`, `<fault-context>`, or `<circuit-breaker>` tags.
  */
 export function appendBlocksToToolAfterEvent(
   event: {
@@ -545,10 +695,10 @@ export function appendBlocksToToolAfterEvent(
   blocks: string[],
 ): void {
   const filtered = blocks.filter((b) => b && b.trim().length > 0);
-  if (filtered.length === 0) return;
   const suffix = filtered.join("\n");
 
   if (event.status === "error") {
+    if (!suffix) return;
     if (typeof event.error === "string") {
       event.error = `${event.error}\n\n${suffix}`;
     } else if (event.error && typeof event.error === "object") {
@@ -566,16 +716,26 @@ export function appendBlocksToToolAfterEvent(
   if (!event.result) return;
 
   if (Array.isArray(event.result.content)) {
-    event.result.content = [
-      ...event.result.content,
-      { type: "text", text: suffix },
-    ];
+    const compactedContent = event.result.content.map((item) => {
+      if (item && item.type === "text" && typeof item.text === "string") {
+        const comp = compactToolOutputHeadTail(item.text);
+        return comp.compacted ? { ...item, text: comp.text } : item;
+      }
+      return item;
+    });
+    event.result.content = suffix
+      ? [...compactedContent, { type: "text", text: suffix }]
+      : compactedContent;
   }
 
   if (typeof event.result.output === "string") {
-    event.result.output = event.result.output
-      ? `${event.result.output}\n\n${suffix}`
-      : suffix;
+    const comp = compactToolOutputHeadTail(event.result.output);
+    const baseOut = comp.text;
+    event.result.output = suffix
+      ? baseOut
+        ? `${baseOut}\n\n${suffix}`
+        : suffix
+      : baseOut;
   }
 }
 
@@ -609,16 +769,17 @@ export function normalizePluginToolResult(raw: unknown): {
         metadata?: Record<string, unknown>;
       };
     }
-    // Avoid leaving a top-level `output` property when no `output` schema is declared
     const { output: rawOutput, content: rawContent, ...rest } = rec;
     const textBody =
       typeof rawContent === "string"
         ? rawContent
         : typeof rec.formatted === "string"
           ? rec.formatted
-          : typeof rec.formattedReport === "string"
-            ? rec.formattedReport
-            : JSON.stringify(raw, null, 2);
+          : typeof rec.formattedBlock === "string"
+            ? rec.formattedBlock
+            : typeof rec.formattedReport === "string"
+              ? rec.formattedReport
+              : JSON.stringify(raw, null, 2);
     return {
       ...rest,
       ...(rawOutput !== undefined ? { rawOutput } : {}),

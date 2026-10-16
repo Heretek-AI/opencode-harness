@@ -2,12 +2,13 @@
  * `src/index.ts` — Unified OpenCode v2 plugin entrypoint.
  *
  * Wires Wave 1–3 modules plus the ported SwarmOS single-session harness
- * upgrades (post-mutation diagnostics, stack-frame fault localizer, atomic
- * edit transactions, stale-read detector, multi-language PageRank RepoMap,
- * blast-radius analyzer, incremental verifier, diff-coverage & anti-tautology
- * auditor, taint tracking, episodic memory, Muse 1.3 calibration,
- * architecture advisor, zero-patch tool/session interceptors, and the
- * native OpenCode V2 `PromiseContext` `default` plugin export).
+ * upgrades (post-mutation diagnostics, cross-file import/export verifier,
+ * stack-frame fault localizer, atomic edit transactions, stale-read detector,
+ * multi-language PageRank RepoMap, blast-radius analyzer, symbol reference
+ * finder, incremental verifier, diff-coverage & anti-tautology auditor,
+ * taint tracking, episodic memory, Muse 1.3 calibration, architecture advisor,
+ * zero-patch tool/session interceptors, and the native OpenCode V2
+ * `PromiseContext` `default` plugin export).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -52,6 +53,7 @@ import {
   analyzeBlastRadius,
   buildRepoMap,
   extractOutline,
+  findSymbolReferences,
   formatBlastRadiusBlock,
   formatRepoMapBlock,
 } from "./repomap/repomap.js";
@@ -76,6 +78,7 @@ export * from "./context/context-budget.js";
 export * from "./context/episodic-memory.js";
 export * from "./ui-auditor/dom-auditor.js";
 export * from "./diagnostics/diagnostics-runner.js";
+export * from "./diagnostics/import-verifier.js";
 export * from "./transactions/edit-transaction.js";
 export * from "./repomap/repomap.js";
 export * from "./verify/verifier.js";
@@ -97,7 +100,7 @@ export type {
 
 export const HARNESS_NAME = "@heretek-ai/opencode-harness";
 export const HARNESS_VERSION = "1.0.0";
-export const HARNESS_RELEASE_VERSION = "1.0.4";
+export const HARNESS_RELEASE_VERSION = "1.0.5";
 
 export const HARNESS_TOOL_NAMES = [
   "file_hash_read",
@@ -114,6 +117,7 @@ export const EXTENDED_HARNESS_TOOL_NAMES = [
   "repo_map",
   "blast_radius",
   "file_outline",
+  "symbol_references",
   "verify_scoped",
   "architecture_audit",
   "checkpoint_create",
@@ -423,6 +427,11 @@ const fileOutlineSchema = z.object({
   path: z.string().min(1),
 });
 
+const symbolReferencesSchema = z.object({
+  symbol: z.string().min(1),
+  maxResults: z.number().int().min(1).max(500).optional(),
+});
+
 const verifyScopedSchema = z.object({
   modifiedFiles: z.array(z.string().min(1)).optional(),
   timeoutMs: z.number().int().min(500).max(300000).optional(),
@@ -488,16 +497,6 @@ export interface ContextHookOverrides {
   lessons?: LessonInput[];
 }
 
-/**
- * Adapt a circuit-breaker verdict to the `{ tripped, directive }` shape the
- * OpenCode V2 host adapter consumes.
- *
- * Accepts both the canonical Wave-4 verdict (`triggered` / `intervention` /
- * `message`) and the alternate `tripped` / `directive` shape so either
- * producer stays compatible; canonical fields win when both are present.
- * Fail-closed: a missing verdict or non-boolean trip flag throws instead of
- * silently reporting "not tripped".
- */
 export function toTrippedDirective(verdict: CircuitBreakerVerdict): {
   tripped: boolean;
   directive?: string;
@@ -696,6 +695,19 @@ export function buildExtendedHarnessTools(
           path: parsed.path,
           symbols: extractOutline(`${resolved.rootDir}/${parsed.path}`),
         };
+      },
+    },
+    symbol_references: {
+      description:
+        "Find all lexer-verified definitions, imports, exports, and call sites of a symbol across the workspace with 1-based line numbers and 4-hex FNV-1a anchors for immediate file_hash_edit.",
+      parameters: symbolReferencesSchema,
+      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+        const parsed = symbolReferencesSchema.parse(args);
+        return findSymbolReferences(
+          parsed.symbol,
+          resolved.rootDir,
+          parsed.maxResults ?? 50,
+        );
       },
     },
     verify_scoped: {

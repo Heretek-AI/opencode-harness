@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { extname, isAbsolute, relative, resolve } from "node:path";
 import { hashReadFile } from "../editors/hashline-tools.js";
+import { verifyModuleImportsAndExports } from "./import-verifier.js";
 
 export interface FileDiagnostic {
   file: string;
@@ -294,6 +295,12 @@ export function collectFileDiagnostics(
       diagnostics = checkJsonSyntax(absPath, content);
     } else if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
       diagnostics = checkJsTsSyntax(absPath, content, ext);
+      if (diagnostics.length === 0) {
+        const importDiags = verifyModuleImportsAndExports(absPath, content);
+        if (importDiags.length > 0) {
+          diagnostics.push(...importDiags);
+        }
+      }
     } else if (ext === ".py") {
       diagnostics = checkPythonSyntax(absPath);
     }
