@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
-import { computeLineHash } from "../editors/hashline-tools.js";
+import { computeLineHash, isPathWithinRoot } from "../editors/hashline-tools.js";
 import {
   beginEditTransaction,
   finalizeEditTransaction,
@@ -428,6 +428,11 @@ function walkWorkspaceFiles(rootDir: string, maxFiles: number = 1500): string[] 
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
       if (results.length >= maxFiles) break;
+      // Never follow symlinks: a planted `link -> /outside` must not pull
+      // external files into rename/repomap writes (fail-closed containment).
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
       if (entry.isDirectory()) {
         if (IGNORED_DIRS.has(entry.name)) continue;
         visit(join(dir, entry.name));
@@ -810,7 +815,9 @@ export function renameSymbolAcrossWorkspace(
   }
 
   const absRoot = resolve(rootDir);
-  const absFiles = walkWorkspaceFiles(absRoot, 1200);
+  const absFiles = walkWorkspaceFiles(absRoot, 1200).filter((abs) =>
+    isPathWithinRoot(abs, absRoot),
+  );
   const escaped = fromSym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const wordGlobalRe = new RegExp(`\\b${escaped}\\b`, "g");
 
@@ -943,6 +950,12 @@ export function moveModuleAndRewriteImports(
   const absRoot = resolve(rootDir);
   const absFrom = isAbsolute(fromPath) ? fromPath : resolve(absRoot, fromPath);
   const absTo = isAbsolute(toPath) ? toPath : resolve(absRoot, toPath);
+
+  if (!isPathWithinRoot(absFrom, absRoot) || !isPathWithinRoot(absTo, absRoot)) {
+    throw new Error(
+      `moveModuleAndRewriteImports: refusing move outside the workspace root (fail-closed): ${JSON.stringify(fromPath)} -> ${JSON.stringify(toPath)}`,
+    );
+  }
 
   if (!existsSync(absFrom)) {
     throw new Error(`Source module does not exist: ${absFrom}`);

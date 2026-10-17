@@ -25,7 +25,8 @@ function verdict(request: GuardRequest) {
 describe("shell-parse classifier", () => {
   test("flags the six destructive operations", () => {
     expect(isDestructiveShellCommand("rm -rf /")).toBe(true);
-    expect(isDestructiveShellCommand("sudo rm -rf /tmp/../")).toBe(false);
+    // `sudo` never launders a traversal wipe: `/tmp/../` normalizes to `/`.
+    expect(isDestructiveShellCommand("sudo rm -rf /tmp/../")).toBe(true);
     expect(isDestructiveShellCommand("rm -rf *")).toBe(true);
     expect(isDestructiveShellCommand("rm -fr /")).toBe(true);
     expect(isDestructiveShellCommand("git reset --hard")).toBe(true);

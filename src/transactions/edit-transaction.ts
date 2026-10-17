@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, isAbsolute, resolve } from "node:path"
+import { isPathWithinRoot } from "../editors/hashline-tools.js"
 
 export interface FileSnapshot {
   absPath: string
@@ -120,9 +121,15 @@ export function beginEditTransaction(
 ): EditTransaction {
   txCounter += 1
   const id = `tx_${Date.now()}_${txCounter}`
+  const absRoot = resolve(workspaceRoot)
   const snapshots = new Map<string, FileSnapshot>()
   for (const p of targetPaths) {
     const absPath = isAbsolute(p) ? p : resolve(workspaceRoot, p)
+    if (!isPathWithinRoot(absPath, absRoot)) {
+      throw new Error(
+        `beginEditTransaction: refusing snapshot outside the workspace root (fail-closed): ${JSON.stringify(p)}`,
+      )
+    }
     if (!snapshots.has(absPath)) {
       snapshots.set(absPath, captureSnapshot(absPath))
     }
@@ -187,8 +194,14 @@ export function createCheckpoint(
 ): CheckpointEntry {
   txCounter += 1
   const id = `chk_${txCounter}`
+  const absRoot = resolve(workspaceRoot)
   const snapshots = filePaths.map((p) => {
     const absPath = isAbsolute(p) ? p : resolve(workspaceRoot, p)
+    if (!isPathWithinRoot(absPath, absRoot)) {
+      throw new Error(
+        `createCheckpoint: refusing snapshot outside the workspace root (fail-closed): ${JSON.stringify(p)}`,
+      )
+    }
     return captureSnapshot(absPath)
   })
   const entry: CheckpointEntry = {

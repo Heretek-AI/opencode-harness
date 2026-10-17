@@ -48,6 +48,12 @@ export interface PatchRepairOutcome {
   addedEnvelope: boolean;
   strippedLinePrefixes: boolean;
   patchText: string;
+  /**
+   * Fail-closed explanation when the input cannot become a valid patch: a
+   * header-less bare hunk carries no target path, so neither this repair nor
+   * upstream `Patch.parse` can accept it.
+   */
+  error?: string;
 }
 
 const READ_TOOL_PREFIX_RE = /^\s*\d+:\s?/gm;
@@ -299,15 +305,26 @@ export function repairPatchToolInputInPlace(
 
   const hasFileHeader =
     /^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+/m.test(text);
-  if (hasFileHeader) {
-    if (!text.startsWith("*** Begin Patch")) {
-      text = `*** Begin Patch\n${text}`;
-      addedEnvelope = true;
-    }
-    if (!text.endsWith("*** End Patch")) {
-      text = `${text}\n*** End Patch`;
-      addedEnvelope = true;
-    }
+  if (!hasFileHeader) {
+    // Header-less bare hunks carry no target path: neither this repair nor
+    // upstream `Patch.parse` can accept them. Fail closed with an explicit
+    // path-required message instead of a silent no-op passthrough.
+    return {
+      repaired: false,
+      addedEnvelope: false,
+      strippedLinePrefixes: false,
+      patchText: text,
+      error:
+        "repairPatchToolInputInPlace: patch text has no `*** Update/Add/Delete File:` header, so the target path is unknown and the hunk cannot be repaired (fail-closed)",
+    };
+  }
+  if (!text.startsWith("*** Begin Patch")) {
+    text = `*** Begin Patch\n${text}`;
+    addedEnvelope = true;
+  }
+  if (!text.endsWith("*** End Patch")) {
+    text = `${text}\n*** End Patch`;
+    addedEnvelope = true;
   }
 
   const lines = text.split("\n");

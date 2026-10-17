@@ -28,6 +28,8 @@ import {
 import {
   defaultGuardConfig,
   evaluateBoardGuard,
+  extractGuardTargetFromArgs,
+  resolveExecuteRole,
   type GuardPolicyConfig,
   type GuardRequest,
   type GuardVerdict,
@@ -220,6 +222,13 @@ export interface HarnessPluginOptions {
   seedRecommendedMcp?: boolean;
   /** Opt-in Muse 1.3 system prompt calibration (default false). */
   museCalibration?: boolean;
+  /**
+   * Opt-in hostnames permitted to resolve to non-public IPs for
+   * `ui_geometry_audit` live URL audits. Default-deny: loopback/LAN/cloud
+   * metadata targets are refused unless listed here (or via the
+   * `OPENCODE_HARNESS_AUDIT_URL_ALLOWLIST` environment variable).
+   */
+  auditAllowedHosts?: string[];
 }
 
 export interface ResolvedHarnessOptions {
@@ -231,6 +240,7 @@ export interface ResolvedHarnessOptions {
   lessons?: LessonInput[];
   seedRecommendedMcp: boolean;
   museCalibration: boolean;
+  auditAllowedHosts: string[];
 }
 
 export interface HarnessPlugin {
@@ -322,12 +332,24 @@ export function resolveHarnessOptions(
       "opencode-harness: museCalibration must be a boolean when present (fail-closed)",
     );
   }
+  if (
+    settings.auditAllowedHosts !== undefined &&
+    (Array.isArray(settings.auditAllowedHosts) === false ||
+      settings.auditAllowedHosts.some(
+        (entry) => typeof entry !== "string" || entry.trim() === "",
+      ))
+  ) {
+    throw new Error(
+      "opencode-harness: auditAllowedHosts must be an array of non-empty strings when present (fail-closed)",
+    );
+  }
   return {
     rootDir,
     guardConfig,
     contextBudgetTokens: Math.floor(budget as number),
     seedRecommendedMcp: settings.seedRecommendedMcp === true,
     museCalibration: settings.museCalibration === true,
+    auditAllowedHosts: settings.auditAllowedHosts ?? [],
     ...(settings.taskMd !== undefined ? { taskMd: settings.taskMd } : {}),
     ...(settings.planMd !== undefined ? { planMd: settings.planMd } : {}),
     ...(settings.lessons !== undefined ? { lessons: settings.lessons } : {}),
@@ -594,6 +616,32 @@ export function registerContextBudgetHook(
 /* Tool tables                                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Explicit permission evaluation for every harness `execute` (OH-6.2): the
+ * guard is consulted with the acting role (`ctx.role`, else the host
+ * `ctx.agent`, else `builder`), the harness tool name, and the target
+ * path/command drawn from the raw args. Denials throw fail-closed before any
+ * filesystem mutation. This never relies on host `options.permission`, which
+ * upstream only uses for disable-ruleset filtering.
+ */
+export function enforceHarnessToolGuard(
+  resolved: ResolvedHarnessOptions,
+  toolName: string,
+  ctx: unknown,
+  args: Record<string, unknown>,
+): void {
+  const role = resolveExecuteRole(ctx);
+  const verdict = evaluateBoardGuard(
+    { role, tool: toolName, ...extractGuardTargetFromArgs(args) },
+    resolved.guardConfig,
+  );
+  if (!verdict.allowed) {
+    throw new Error(
+      `opencode-harness: ${toolName} denied for role ${JSON.stringify(role)}: ${verdict.reason} (fail-closed)`,
+    );
+  }
+}
+
 export function buildHarnessTools(
   resolved: ResolvedHarnessOptions,
 ): Record<HarnessToolName, ToolDefinition> {
@@ -603,7 +651,8 @@ export function buildHarnessTools(
         "Read a workspace file with 4-hex FNV-1a hash-anchored lines " +
         "(<lineNo>#<hash>| <content>); supports 1-based offset/limit windows.",
       parameters: fileHashReadSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "file_hash_read", ctx, args);
         const parsed = fileHashReadSchema.parse(args);
         return hashReadFile(
           resolved.rootDir,
@@ -619,7 +668,8 @@ export function buildHarnessTools(
         "across +/-25 shifted lines and any mismatch fails closed with no " +
         "disk write.",
       parameters: fileHashEditSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "file_hash_edit", ctx, args);
         const parsed = fileHashEditSchema.parse(args);
         return hashEditFile(resolved.rootDir, parsed.path, parsed.hunks);
       },
@@ -630,7 +680,8 @@ export function buildHarnessTools(
         "(@ast-grep/napi with a deterministic fallback); returns " +
         "text plus 1-based start/end lines.",
       parameters: astStructuralSearchSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "ast_structural_search", ctx, args);
         const parsed = astStructuralSearchSchema.parse(args);
         return astSearch(parsed.code, parsed.pattern, parsed.language);
       },
@@ -641,7 +692,8 @@ export function buildHarnessTools(
         "the matched pattern into the rewrite template and writes the " +
         "file only when at least one match is replaced.",
       parameters: astStructuralRewriteSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "ast_structural_rewrite", ctx, args);
         const parsed = astStructuralRewriteSchema.parse(args);
         return astRewriteFile(
           resolved.rootDir,
@@ -659,10 +711,13 @@ export function buildHarnessTools(
         "risk, sibling collision, and row baseline jitter; or audits a " +
         "live http(s) URL headlessly with WCAG 2.2 axe tags.",
       parameters: uiGeometryAuditSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "ui_geometry_audit", ctx, args);
         const parsed = uiGeometryAuditSchema.parse(args);
         if (parsed.url !== undefined) {
-          return auditLivePageWithPlaywright(parsed.url, parsed.viewports);
+          return auditLivePageWithPlaywright(parsed.url, parsed.viewports, {
+            allowedHosts: resolved.auditAllowedHosts,
+          });
         }
         if (parsed.elements !== undefined) {
           const defects = evaluateDomGeometryInPage(parsed.elements);
@@ -691,7 +746,8 @@ export function buildExtendedHarnessTools(
       description:
         "Compute a PageRank-ranked repository dependency map showing top architectural modules and their exported symbols.",
       parameters: repoMapSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "repo_map", ctx, args);
         const parsed = repoMapSchema.parse(args);
         const map = buildRepoMap(resolved.rootDir);
         return {
@@ -705,7 +761,8 @@ export function buildExtendedHarnessTools(
       description:
         "Analyze the direct importers, transitive dependents, symbol callers, and affected test files for a target module before mutating its public contract.",
       parameters: blastRadiusSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "blast_radius", ctx, args);
         const parsed = blastRadiusSchema.parse(args);
         const res = analyzeBlastRadius(
           parsed.path,
@@ -722,7 +779,8 @@ export function buildExtendedHarnessTools(
       description:
         "Extract a compact structural symbol outline (functions, classes, interfaces, types, structs) with 1-based line numbers without reading the full file body.",
       parameters: fileOutlineSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "file_outline", ctx, args);
         const parsed = fileOutlineSchema.parse(args);
         return {
           path: parsed.path,
@@ -734,7 +792,8 @@ export function buildExtendedHarnessTools(
       description:
         "Find all lexer-verified definitions, imports, exports, and call sites of a symbol across the workspace with 1-based line numbers and 4-hex FNV-1a anchors for immediate file_hash_edit.",
       parameters: symbolReferencesSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "symbol_references", ctx, args);
         const parsed = symbolReferencesSchema.parse(args);
         return findSymbolReferences(
           parsed.symbol,
@@ -751,6 +810,7 @@ export function buildExtendedHarnessTools(
         args: Record<string, unknown>,
         ctx?: ToolContext,
       ): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "rename_symbol", ctx, args);
         const parsed = renameSymbolSchema.parse(args);
         return renameSymbolAcrossWorkspace(
           parsed.oldSymbol,
@@ -764,7 +824,8 @@ export function buildExtendedHarnessTools(
       description:
         "Run blast-radius-scoped incremental verification (typecheck, lint, and affected tests) and return structured file:line:col failure locations.",
       parameters: verifyScopedSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "verify_scoped", ctx, args);
         const parsed = verifyScopedSchema.parse(args);
         return runIncrementalVerification({
           rootDir: resolved.rootDir,
@@ -777,7 +838,8 @@ export function buildExtendedHarnessTools(
       description:
         "Audit workspace architecture for circular module dependencies (Tarjan SCC), unused exported symbols, orphan modules, oversized god-files, empty catch blocks, and high-arity functions.",
       parameters: architectureAuditSchema,
-      execute: async (args: Record<string, unknown>): Promise<unknown> => {
+      execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "architecture_audit", ctx, args);
         const parsed = architectureAuditSchema.parse(args);
         return runArchitectureAudit(resolved.rootDir, parsed.files);
       },
@@ -790,6 +852,7 @@ export function buildExtendedHarnessTools(
         args: Record<string, unknown>,
         ctx?: ToolContext,
       ): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "checkpoint_create", ctx, args);
         const parsed = checkpointCreateSchema.parse(args);
         const entry = createCheckpoint(
           ctx?.sessionId ?? "default",
@@ -812,6 +875,7 @@ export function buildExtendedHarnessTools(
         args: Record<string, unknown>,
         ctx?: ToolContext,
       ): Promise<unknown> => {
+        enforceHarnessToolGuard(resolved, "checkpoint_rollback", ctx, args);
         const parsed = checkpointRollbackSchema.parse(args);
         const outcome = rollbackCheckpoint(
           ctx?.sessionId ?? "default",

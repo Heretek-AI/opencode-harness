@@ -26,6 +26,15 @@ fi
 git -C "$OPENCODE_DIR" fetch -q --depth 1 origin "$OPENCODE_REF"
 git -C "$OPENCODE_DIR" checkout -q --force FETCH_HEAD
 
+# Supply-chain verification: the checkout must equal the pinned commit out of
+# band. A fetch that resolves to anything else fails closed here instead of
+# running the host test against unverified upstream code.
+actual_ref="$(git -C "$OPENCODE_DIR" rev-parse HEAD)"
+if [[ "$actual_ref" != "$OPENCODE_REF" ]]; then
+  echo "host-test: refusing unexpected upstream commit $actual_ref (wanted $OPENCODE_REF)" >&2
+  exit 1
+fi
+
 # Unrelated workspace packages pull optional git/pkg.pr.new tarballs that some
 # networks block; packages/core does not need them. A genuinely missing core
 # dependency still fails the host test below.

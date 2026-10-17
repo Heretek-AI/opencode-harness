@@ -174,6 +174,10 @@ export function clearSessionLineage(): void {
   SESSION_PARENT_MAP.clear();
 }
 
+export function getSessionParent(sessionId: string): string | undefined {
+  return SESSION_PARENT_MAP.get(sessionId);
+}
+
 /**
  * Rewrites `x-session-affinity`, `X-Session-Id`, and `x-opencode-session` headers
  * in `session.hook("model.request")` so depth >= 2 subagents and forked child
@@ -240,7 +244,7 @@ export function handleSessionRetryInPlace(
   // 1. Hard stop on non-recoverable errors or excessive attempts
   if (
     attempt > 6 ||
-    /\b(?:auth|unauthorized|invalid_api_key|forbidden|permission|aborted|cancelled|not-found|not_found|context-overflow|context_overflow)\b/.test(
+    /\b(?:auth|unauthorized|invalid[_\s-]?api[_\s-]?key|forbidden|permission|aborted|cancelled|not-found|not_found|context-overflow|context_overflow)\b/.test(
       combined,
     )
   ) {
