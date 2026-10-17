@@ -61,12 +61,20 @@ export interface DOMAuditReport {
   viewports?: ViewportAuditResult[];
 }
 
+/** Opt-in policy for live URL audits (server-side only; never model-controlled). */
+export interface AuditUrlPolicy {
+  /** Exact hostnames (case-insensitive) permitted to resolve to non-public IPs. */
+  allowedHosts?: string[];
+}
+
 export const MIN_INTERACTIVE_SIZE_PX = 24;
 export const OVERFLOW_TOLERANCE_PX = 2;
 export const SIBLING_OVERLAP_TOLERANCE_PX = 2;
 export const ROW_JITTER_MIN_PX = 0.5;
 export const ROW_JITTER_MAX_PX = 3.5;
 export const MIN_DESCENDER_LINE_HEIGHT_RATIO = 1.15;
+/** Upper bound on viewports per live audit (bounds browser work). */
+export const MAX_AUDIT_VIEWPORTS = 8;
 
 const DEFAULT_VIEWPORTS: ViewportInput[] = [
   { name: "desktop", width: 1280, height: 800 },
@@ -305,6 +313,11 @@ function validateViewports(viewports: ViewportInput[] | undefined): ViewportInpu
       "dom-auditor: viewports must be a non-empty array when provided (fail-closed)",
     );
   }
+  if (viewports.length > MAX_AUDIT_VIEWPORTS) {
+    throw new Error(
+      `dom-auditor: refusing audit of ${viewports.length} viewports (maximum ${MAX_AUDIT_VIEWPORTS}, fail-closed)`,
+    );
+  }
   viewports.forEach((viewport, index) => {
     const shapeOk =
       viewport !== null &&
@@ -326,6 +339,128 @@ function validateViewports(viewports: ViewportInput[] | undefined): ViewportInpu
   return [...viewports];
 }
 
+/** Cloud metadata endpoints: never fetchable, even via the allowlist. */
+const METADATA_HOSTS = new Set([
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data",
+  "instance-data.compute.internal",
+]);
+
+function envAuditAllowlist(): string[] {
+  const raw = process.env.OPENCODE_HARNESS_AUDIT_URL_ALLOWLIST ?? "";
+  return raw
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+}
+
+function ipv4Blocked(value: string): boolean {
+  const parts = value.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) {
+      return false;
+    }
+    const num = Number(part);
+    if (!Number.isInteger(num) || num < 0 || num > 255) {
+      return false;
+    }
+    octets.push(num);
+  }
+  const [a, b] = octets as [number, number];
+  if (a === 127) return true; // loopback 127.0.0.0/8
+  if (a === 10) return true; // private 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // private 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // private 192.168.0.0/16
+  if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
+  if (a === 0) return true; // "this network"
+  return false;
+}
+
+/** True for loopback, private, link-local, or otherwise non-public IPs. */
+export function isNonPublicIpAddress(address: string): boolean {
+  const normalized = address
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1")
+    .split("%")[0] as string;
+  if (normalized === "::" || normalized === "::ffff:0.0.0.0") {
+    return true;
+  }
+  if (normalized === "localhost") {
+    return true;
+  }
+  if (normalized.includes(":")) {
+    if (normalized === "::1") {
+      return true;
+    }
+    if (normalized.startsWith("::ffff:")) {
+      return ipv4Blocked(normalized.slice("::ffff:".length));
+    }
+    const head = (normalized.split(":")[0] ?? "").toLowerCase();
+    if (head === "fe80") {
+      return true; // IPv6 link-local fe80::/10
+    }
+    if (head.startsWith("fc") || head.startsWith("fd")) {
+      return true; // IPv6 unique-local fc00::/7
+    }
+    return false;
+  }
+  return ipv4Blocked(normalized);
+}
+
+/**
+ * Resolve the audit target and enforce the SSRF policy (fail-closed):
+ * non-http(s) URLs, unresolvable hosts, cloud metadata endpoints, and hosts
+ * resolving to non-public IPs are refused unless the exact hostname is
+ * opted in via `policy.allowedHosts` or the
+ * `OPENCODE_HARNESS_AUDIT_URL_ALLOWLIST` environment variable.
+ */
+export async function resolveAuditTarget(
+  url: string,
+  policy?: AuditUrlPolicy,
+): Promise<URL> {
+  const target = parseAuditUrl(url);
+  const host = target.hostname.toLowerCase();
+  const allowlist = new Set<string>([
+    ...(policy?.allowedHosts ?? []).map((entry) => entry.toLowerCase()),
+    ...envAuditAllowlist(),
+  ]);
+  if (METADATA_HOSTS.has(host)) {
+    throw new Error(
+      `dom-auditor: refusing cloud metadata audit URL ${JSON.stringify(url)} (fail-closed)`,
+    );
+  }
+  if (host === "localhost" || host.endsWith(".localhost")) {
+    if (!allowlist.has(host)) {
+      throw new Error(
+        `dom-auditor: refusing loopback audit URL ${JSON.stringify(url)} (fail-closed; opt in with allowedHosts for ${JSON.stringify(host)})`,
+      );
+    }
+    return target;
+  }
+  let resolved: string[];
+  try {
+    const { lookup } = await import("node:dns/promises");
+    const records = await lookup(host, { all: true });
+    resolved = records.map((record) => record.address);
+  } catch (dnsError) {
+    throw new Error(
+      `dom-auditor: refusing audit URL with unresolvable host ${JSON.stringify(host)}: ${(dnsError as Error).message} (fail-closed)`,
+    );
+  }
+  const blocked = resolved.filter((address) => isNonPublicIpAddress(address));
+  if (blocked.length > 0 && !allowlist.has(host)) {
+    throw new Error(
+      `dom-auditor: refusing non-public audit target ${JSON.stringify(url)} (host ${JSON.stringify(host)} resolves to ${blocked.join(",")}) (fail-closed; opt in with allowedHosts)`,
+    );
+  }
+  return target;
+}
+
 /**
  * Audit a live page with headless Chromium: for every requested viewport the
  * page is loaded, `@axe-core/playwright` runs with the WCAG 2.2 tag set,
@@ -342,21 +477,85 @@ function validateViewports(viewports: ViewportInput[] | undefined): ViewportInpu
 export async function auditLivePageWithPlaywright(
   url: string,
   viewports?: ViewportInput[],
+  policy?: AuditUrlPolicy,
 ): Promise<DOMAuditReport> {
-  const target = parseAuditUrl(url);
+  const target = await resolveAuditTarget(url, policy);
   const viewportList = validateViewports(viewports);
-  const [{ chromium }, { default: AxeBuilder }] = await Promise.all([
-    import("playwright"),
-    import("@axe-core/playwright"),
-  ]);
+  let chromium: typeof import("playwright").chromium;
+  // Structural type for the `@axe-core/playwright` default export (kept
+  // local so live audits degrade to a clear fail-closed error when the
+  // optional peer dependency is absent).
+  let AxeBuilder: new (args: {
+    page: unknown;
+  }) => {
+    withTags: (tags: string[]) => { analyze: () => Promise<unknown> };
+  };
+  try {
+    const [playwrightMod, axeMod] = await Promise.all([
+      import("playwright"),
+      import("@axe-core/playwright"),
+    ]);
+    chromium = playwrightMod.chromium;
+    AxeBuilder = axeMod.default as unknown as typeof AxeBuilder;
+  } catch (dependencyError) {
+    throw new Error(
+      `dom-auditor: live audit unavailable: install the optional peer dependencies "playwright" and "@axe-core/playwright" to enable browser mode (${(dependencyError as Error).message}) (fail-closed)`,
+    );
+  }
   const browser = await chromium.launch({ headless: true });
   const defects: GeometryDefect[] = [];
   const axeViolations: unknown[] = [];
   const viewportResults: ViewportAuditResult[] = [];
+  // Cache per-host SSRF decisions so every redirect hop is re-checked
+  // without repeating DNS lookups.
+  const hostDecisions = new Map<string, boolean>();
+  const isRequestUrlAllowed = async (rawUrl: string): Promise<boolean> => {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return false;
+    }
+    if (parsed.protocol === "data:" || parsed.protocol === "blob:") {
+      return true;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    const cached = hostDecisions.get(host);
+    if (cached !== undefined) {
+      return cached;
+    }
+    try {
+      await resolveAuditTarget(parsed.toString(), policy);
+      hostDecisions.set(host, true);
+      return true;
+    } catch {
+      hostDecisions.set(host, false);
+      return false;
+    }
+  };
   try {
     for (const viewport of viewportList) {
       const context = await browser.newContext({
         viewport: { width: viewport.width, height: viewport.height },
+      });
+      // Block redirects (and subresources) escaping to non-public targets.
+      await context.route("**/*", async (route) => {
+        try {
+          if (await isRequestUrlAllowed(route.request().url())) {
+            await route.continue();
+          } else {
+            await route.abort("blockedbyclient");
+          }
+        } catch {
+          try {
+            await route.abort("blockedbyclient");
+          } catch {
+            // Aborting is best-effort; the navigation timeout still bounds us.
+          }
+        }
       });
       const page = await context.newPage();
       try {
@@ -364,9 +563,17 @@ export async function auditLivePageWithPlaywright(
           waitUntil: "domcontentloaded",
           timeout: 30_000,
         });
-        const axeResults = await new AxeBuilder({ page })
+        const axeResults = (await new AxeBuilder({ page })
           .withTags(AXE_TAGS)
-          .analyze();
+          .analyze()) as {
+          violations?: Array<{
+            id?: unknown;
+            help?: unknown;
+            description?: unknown;
+            impact?: unknown;
+            nodes?: unknown;
+          }>;
+        };
         const violations = Array.isArray(axeResults.violations)
           ? axeResults.violations
           : [];

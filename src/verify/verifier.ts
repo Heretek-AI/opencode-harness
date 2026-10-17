@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
-import { existsSync, readFileSync, statSync } from "node:fs"
-import { isAbsolute, relative, resolve } from "node:path"
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { analyzeBlastRadius } from "../repomap/repomap.js"
 
 export interface RepoCheckCommands {
@@ -111,21 +111,85 @@ export function parseVerificationFailures(rawOutput: string): VerificationFailur
   return failures
 }
 
+/**
+ * Fail-closed containment for scoped test entries: the candidate must
+ * resolve (via realpath of the nearest existing ancestor, so symlinked
+ * paths are followed) at or under the workspace root. `../outside.test.ts`
+ * and absolute paths outside the root are rejected.
+ */
+export function isContainedTestPath(
+  candidate: string,
+  absRoot: string,
+  realRoot?: string,
+): boolean {
+  const root = resolve(absRoot)
+  let anchored: string
+  try {
+    anchored = realRoot ?? realpathSync(root)
+  } catch {
+    anchored = root
+  }
+  const abs = isAbsolute(candidate) ? candidate : resolve(root, candidate)
+  if (abs.includes("\0")) {
+    return false
+  }
+  let probe = abs
+  const descended: string[] = []
+  while (!existsSync(probe)) {
+    const parent = dirname(probe)
+    if (parent === probe) {
+      break
+    }
+    descended.unshift(probe.slice(parent.length + 1))
+    probe = parent
+  }
+  if (!existsSync(probe)) {
+    // Nothing exists to anchor resolution: only allow plain relative paths
+    // that stay inside the root by construction.
+    const rel = candidate.replace(/\\/g, "/")
+    return (
+      !isAbsolute(candidate) &&
+      rel !== ".." &&
+      !rel.startsWith("../") &&
+      !rel.split("/").includes("..")
+    )
+  }
+  let realBase: string
+  try {
+    realBase = realpathSync(probe)
+  } catch {
+    return false
+  }
+  const resolved = descended.length > 0 ? join(realBase, ...descended) : realBase
+  const prefix = anchored.endsWith(sep) ? anchored : anchored + sep
+  return resolved === anchored || resolved.startsWith(prefix)
+}
+
 export function computeScopedTestsForFiles(
   modifiedFiles: string[],
   rootDir: string = process.cwd(),
 ): string[] {
   const absRoot = resolve(rootDir)
+  let realRoot: string
+  try {
+    realRoot = realpathSync(absRoot)
+  } catch {
+    realRoot = absRoot
+  }
   const affectedTests = new Set<string>()
 
   for (const file of modifiedFiles) {
     const rel = (isAbsolute(file) ? relative(absRoot, file) : file).replace(/\\/g, "/")
-    if (/(?:\.test\.|\.spec\.|__tests__|\/test\/|^test\/)/i.test(rel)) {
-      affectedTests.add(rel)
+    if (isContainedTestPath(file, absRoot, realRoot)) {
+      if (/(?:\.test\.|\.spec\.|__tests__|\/test\/|^test\/)/i.test(rel)) {
+        affectedTests.add(rel)
+      }
     }
     const radius = analyzeBlastRadius(rel, absRoot)
     for (const t of radius.affectedTests) {
-      affectedTests.add(t)
+      if (isContainedTestPath(t, absRoot, realRoot)) {
+        affectedTests.add(t)
+      }
     }
   }
 

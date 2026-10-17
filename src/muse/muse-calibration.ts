@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
-import { existsSync, readFileSync } from "node:fs"
-import { isAbsolute, relative, resolve } from "node:path"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { isAbsolute, join, relative, resolve } from "node:path"
 
 export const MUSE_MODEL_IDENTIFIER = "opencode-go/muse-spark-1.3-contributor"
 
@@ -93,15 +93,88 @@ export function captureWorkspaceDigests(
   return map
 }
 
+const RECEIPT_SCAN_IGNORED_DIRS = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  "target",
+])
+
+/**
+ * List repo-relative file paths under `rootDir` (symlinks skipped, heavy
+ * directories ignored), sorted, capped at `maxFiles`.
+ */
+export function listWorkspaceRelPaths(
+  rootDir: string = process.cwd(),
+  maxFiles: number = 5000,
+): string[] {
+  const absRoot = resolve(rootDir)
+  const rels: string[] = []
+  const queue: string[] = [absRoot]
+  let visited = 0
+  while (queue.length > 0 && rels.length < maxFiles && visited < 10000) {
+    const dir = queue.shift()!
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (err) {
+      if (err) continue
+      continue
+    }
+    for (const entry of entries) {
+      visited += 1
+      if (visited >= 10000 || rels.length >= maxFiles) break
+      if (entry.isSymbolicLink()) continue
+      const abs = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (!RECEIPT_SCAN_IGNORED_DIRS.has(entry.name)) queue.push(abs)
+      } else if (entry.isFile()) {
+        rels.push(relative(absRoot, abs).replace(/\\/g, "/"))
+      }
+    }
+  }
+  rels.sort()
+  return rels
+}
+
+/**
+ * Rescan the workspace for files absent from the pre-execution path set
+ * (created files are invisible to a before-only receipt). Returns at most
+ * `maxNewFiles` repo-relative paths, sorted, so the mutation receipt can
+ * append `before="none"` entries for them. Callers must pass the COMPLETE
+ * pre-execution file set (see `listWorkspaceRelPaths`); passing only the
+ * top-ranked digest keys would misreport every other pre-existing file.
+ */
+export function diffNewWorkspaceFiles(
+  knownRelPaths: ReadonlySet<string> | ReadonlyMap<string, unknown>,
+  rootDir: string = process.cwd(),
+  maxNewFiles: number = 200,
+): string[] {
+  const known = knownRelPaths instanceof Set ? knownRelPaths : new Set(knownRelPaths.keys())
+  return listWorkspaceRelPaths(rootDir)
+    .filter((rel) => !known.has(rel))
+    .slice(0, maxNewFiles)
+}
+
 export function createMutationReceipt(
   sessionId: string,
   beforeDigests: Map<string, string | null>,
   rootDir: string = process.cwd(),
+  additionalRelPaths: string[] = [],
 ): MutationReceipt {
   const absRoot = resolve(rootDir)
+  const merged = new Map<string, string | null>(beforeDigests)
+  for (const rel of additionalRelPaths) {
+    if (typeof rel === "string" && rel !== "" && !merged.has(rel)) {
+      merged.set(rel, null)
+    }
+  }
   const files: FileMutationDigest[] = []
 
-  for (const [rel, beforeSha] of beforeDigests.entries()) {
+  for (const [rel, beforeSha] of merged.entries()) {
     const abs = resolve(absRoot, rel)
     const afterSha = sha256File(abs)
     const changed = beforeSha !== afterSha

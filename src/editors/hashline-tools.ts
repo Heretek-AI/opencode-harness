@@ -14,7 +14,8 @@
  *   write) on any anchor mismatch.
  */
 
-import { join, normalize, sep } from "node:path";
+import { dirname, join, normalize, resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 
 export const HASH_SHIFT_WINDOW = 25;
 
@@ -63,7 +64,11 @@ export function computeLineHash(line: string): string {
 
 /**
  * Resolve `relPath` under `rootDir`, failing closed on absolute paths,
- * `..` traversal, or NUL bytes. Returns the absolute target path.
+ * `..` traversal, NUL bytes, or symlink escapes. The nearest existing
+ * ancestor directory is resolved with `realpath` and the remainder joined
+ * back on; the result must stay at or under the real root, so a planted
+ * `link -> /outside` can never redirect a read or write out of the
+ * workspace. Returns the absolute contained path.
  */
 export function resolveSafePath(rootDir: string, relPath: string): string {
   if (typeof relPath !== "string" || relPath.length === 0) {
@@ -89,7 +94,69 @@ export function resolveSafePath(rootDir: string, relPath: string): string {
       `hashline-tools: refusing path outside rootDir: ${JSON.stringify(relPath)} (fail-closed)`,
     );
   }
-  return join(rootDir, normalized);
+  return assertPathWithinRoot(resolve(rootDir, normalized), resolve(rootDir));
+}
+
+/**
+ * Fail-closed containment for an absolute path against an absolute root:
+ * `realpath` the nearest existing ancestor, re-append the non-existent
+ * remainder, and require the result to equal the real root or live under it.
+ * Throws on escapes (symlink or otherwise) and when nothing exists to anchor
+ * the resolution.
+ */
+export function assertPathWithinRoot(absPath: string, absRoot: string): string {
+  if (typeof absPath !== "string" || typeof absRoot !== "string") {
+    throw new Error(
+      "hashline-tools: path containment requires string inputs (fail-closed)",
+    );
+  }
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(absRoot);
+  } catch {
+    realRoot = absRoot;
+  }
+  let probe = absPath;
+  const descended: string[] = [];
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) {
+      break;
+    }
+    descended.unshift(probe.slice(parent.length + 1));
+    probe = parent;
+  }
+  if (!existsSync(probe)) {
+    throw new Error(
+      `hashline-tools: refusing path with no existing ancestor under rootDir: ${JSON.stringify(absPath)} (fail-closed)`,
+    );
+  }
+  let realBase: string;
+  try {
+    realBase = realpathSync(probe);
+  } catch {
+    throw new Error(
+      `hashline-tools: refusing path that cannot be resolved under rootDir: ${JSON.stringify(absPath)} (fail-closed)`,
+    );
+  }
+  const resolved = descended.length > 0 ? join(realBase, ...descended) : realBase;
+  const prefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
+  if (resolved !== realRoot && !resolved.startsWith(prefix)) {
+    throw new Error(
+      `hashline-tools: refusing symlink escape outside rootDir: ${JSON.stringify(absPath)} resolves to ${JSON.stringify(resolved)} (fail-closed)`,
+    );
+  }
+  return resolved;
+}
+
+/** Non-throwing containment probe used by batch writers (rename, checkpoints). */
+export function isPathWithinRoot(absPath: string, absRoot: string): boolean {
+  try {
+    assertPathWithinRoot(absPath, absRoot);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Split raw file text into lines, dropping the phantom trailing element. */

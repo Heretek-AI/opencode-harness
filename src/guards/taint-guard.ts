@@ -1,4 +1,5 @@
-import { parseCommandSegments } from "./shell-parse.js";
+import { getSessionParent } from "../interceptors/session-interceptors.js";
+import { commandBasename, parseCommandSegments } from "./shell-parse.js";
 
 export interface TaintRecord {
   sessionId: string;
@@ -23,13 +24,42 @@ const UNTRUSTED_INGESTION_TOOLS = new Set([
   "fetch",
 ]);
 
+/**
+ * MCP server ids whose `<server>_<tool>` discovery names must arm taint.
+ * Upstream names MCP tools `server_tool` with no `mcp_` prefix, so the
+ * historic `mcp_`-prefix check never fired for the recommended servers.
+ */
+const KNOWN_MCP_SERVER_IDS = ["fallow-mcp", "lsp-mcp-server"];
+
 export function isUntrustedIngestionTool(toolName: string): boolean {
-  const lower = toolName.toLowerCase();
-  return (
-    UNTRUSTED_INGESTION_TOOLS.has(lower) ||
-    lower.startsWith("mcp_") ||
-    lower.startsWith("mcp:")
-  );
+  const lower = (toolName ?? "").toLowerCase();
+  if (lower === "") {
+    return false;
+  }
+  if (UNTRUSTED_INGESTION_TOOLS.has(lower)) {
+    return true;
+  }
+  if (lower.startsWith("mcp_") || lower.startsWith("mcp:")) {
+    return true;
+  }
+  for (const server of KNOWN_MCP_SERVER_IDS) {
+    if (
+      lower === server ||
+      lower.startsWith(`${server}_`) ||
+      lower.startsWith(`${server}-`) ||
+      lower.startsWith(`${server}:`)
+    ) {
+      return true;
+    }
+  }
+  // Generic MCP discovery id `<server>_<tool>`: a hyphenated server segment
+  // before the first `_` distinguishes MCP ids (`my-server_tool`) from
+  // harness `snake_case` tools (`file_hash_read`, `ast_structural_search`).
+  const underscore = lower.indexOf("_");
+  if (underscore > 0 && lower.slice(0, underscore).includes("-")) {
+    return true;
+  }
+  return false;
 }
 
 export function recordUntrustedContentTaint(
@@ -60,6 +90,30 @@ export function clearTaintState(sessionId?: string): void {
 }
 
 /**
+ * Resolve the nearest taint records for `sessionId`, walking up the
+ * `recordSessionParentLink` fork/subagent/compaction chain so child sessions
+ * inherit their parent's taint (fail-closed: a fork of a tainted session is
+ * tainted).
+ */
+function resolveTaintChain(sessionId: string): TaintRecord[] {
+  const visited = new Set<string>();
+  let current: string | undefined = sessionId;
+  while (current !== undefined && !visited.has(current)) {
+    visited.add(current);
+    const list = SESSION_TAINT.get(current);
+    if (list !== undefined && list.length > 0) {
+      return list;
+    }
+    current = getSessionParent(current);
+  }
+  return [];
+}
+
+function denyTaint(ruleId: string, reason: string): TaintVerdict {
+  return { action: "deny", ruleId, reason };
+}
+
+/**
  * Evaluates whether a shell command or sensitive file mutation in a tainted session
  * attempts to exfiltrate credentials, pipe remote scripts to a shell, or mutate git hooks.
  */
@@ -68,8 +122,8 @@ export function evaluateTaintGuard(
   commandOrPath: string,
   actionType: "shell" | "file" = "shell",
 ): TaintVerdict {
-  const taints = SESSION_TAINT.get(sessionId);
-  if (!taints || taints.length === 0) {
+  const taints = resolveTaintChain(sessionId);
+  if (taints.length === 0) {
     return { action: "allow" };
   }
 
@@ -78,47 +132,115 @@ export function evaluateTaintGuard(
 
   if (actionType === "file") {
     const norm = commandOrPath.replace(/\\/g, "/");
+    const lower = norm.toLowerCase();
     if (
       norm.includes(".git/hooks") ||
       norm.includes(".git/config") ||
+      /(^|\/)\.ssh(\/|$)/.test(norm) ||
+      norm.includes(".aws/") ||
+      /(^|\/)\.env(\.[^/]*)?$/.test(lower) ||
       norm.endsWith(".bashrc") ||
       norm.endsWith(".zshrc") ||
       norm.endsWith(".profile")
     ) {
-      return {
-        action: "deny",
-        ruleId: "TAINT-FILE-1",
-        reason: `Blocked mutation of sensitive execution hook "${commandOrPath}" while session is tainted by untrusted tool "${latestSource}".`,
-      };
+      return denyTaint(
+        "TAINT-FILE-1",
+        `Blocked mutation of sensitive credential/hook path "${commandOrPath}" while session is tainted by untrusted tool "${latestSource}".`,
+      );
     }
     return { action: "allow" };
   }
 
   const segments = parseCommandSegments(commandOrPath);
+  const effectiveExes = segments.map((seg) => {
+    const direct = commandBasename(seg.executable);
+    if (direct !== "") {
+      return direct;
+    }
+    const chain = seg.wrapperChain ?? [];
+    return chain.length > 0 ? commandBasename(chain[chain.length - 1] ?? "") : "";
+  });
+  const exeSet = new Set(effectiveExes);
+  const hasFetcher = exeSet.has("curl") || exeSet.has("wget");
+  const hasShellTarget =
+    exeSet.has("sh") ||
+    exeSet.has("bash") ||
+    exeSet.has("zsh") ||
+    exeSet.has("dash") ||
+    exeSet.has("ksh");
+
+  // Remote script piped straight into a shell (`curl URL | sh`): deny.
+  if (hasFetcher && hasShellTarget && segments.length > 1) {
+    return denyTaint(
+      "TAINT-PIPE-1",
+      `Blocked piping a remote download into a shell ("${commandOrPath}") while session is tainted by untrusted tool "${latestSource}".`,
+    );
+  }
+
   for (const seg of segments) {
-    const exe = seg.executable.split("/").pop() ?? seg.executable;
+    const exe = commandBasename(seg.executable) !== ""
+      ? commandBasename(seg.executable)
+      : commandBasename((seg.wrapperChain ?? [])[(seg.wrapperChain ?? []).length - 1] ?? "");
     const joinedArgs = seg.args.join(" ");
 
-    if (["curl", "wget", "nc", "ncat", "scp", "ssh"].includes(exe)) {
+    // `wget` writes remote content to disk silently: deny when tainted.
+    if (exe === "wget") {
+      return denyTaint(
+        "TAINT-NET-2",
+        `Blocked remote download via "wget" after ingesting untrusted content from "${latestSource}".`,
+      );
+    }
+
+    if (["curl", "nc", "ncat", "scp", "sftp", "ssh"].includes(exe)) {
+      if (exe !== "curl") {
+        return denyTaint(
+          "TAINT-NET-2",
+          `Blocked remote execution/transfer via "${exe}" after ingesting untrusted content from "${latestSource}".`,
+        );
+      }
       if (
-        /(-d|--data|--upload-file|-F|\bPOST\b|\bPUT\b|\$|\benv\b|\.env|id_rsa|token|secret|key)/i.test(
+        /(-d|--data|--upload-file|-F|\bPOST\b|\bPUT\b|\$|\benv\b|\.env|id_rsa|token|secret|key|\.ssh|\.aws)/i.test(
           joinedArgs,
-        )
+        ) ||
+        /(^|\s)(-o\b|--output\b|-O\b|--remote-name\b)/.test(` ${joinedArgs} `)
       ) {
-        return {
-          action: "deny",
-          ruleId: "TAINT-NET-1",
-          reason: `Blocked potential credential/data exfiltration via "${exe}" after ingesting untrusted content from "${latestSource}".`,
-        };
+        return denyTaint(
+          "TAINT-NET-1",
+          `Blocked potential credential/data exfiltration via "${exe}" after ingesting untrusted content from "${latestSource}".`,
+        );
       }
     }
 
-    if (exe === "printenv" || (exe === "env" && seg.args.length === 0)) {
-      return {
-        action: "ask",
-        ruleId: "TAINT-ENV-1",
-        reason: `Dumping environment variables requires confirmation after ingesting untrusted content from "${latestSource}".`,
-      };
+    // `git push` from a tainted session can exfiltrate or rewrite remotes.
+    if (exe === "git" && seg.args.some((a) => a.toLowerCase() === "push")) {
+      return denyTaint(
+        "TAINT-GIT-1",
+        `Blocked "git push" while session is tainted by untrusted tool "${latestSource}".`,
+      );
+    }
+
+    // `env`/`printenv` dump secrets or launder commands (`env rm ...`).
+    if (exe === "printenv" || exe === "env") {
+      return denyTaint(
+        "TAINT-ENV-1",
+        `Blocked environment dump/laundering via "${exe}" after ingesting untrusted content from "${latestSource}".`,
+      );
+    }
+
+    // Pager/readers aimed at credential paths (`cat ~/.ssh/id_rsa`).
+    if (["cat", "less", "more", "head", "tail"].includes(exe)) {
+      const target = joinedArgs.replace(/\\/g, "/");
+      if (
+        /(^|\/)\.ssh(\/|$)/.test(target) ||
+        target.includes(".aws/") ||
+        /(^|\/)(\.env)(\.[^/]*)?(\s|$)/i.test(target) ||
+        /id_rsa|\.pem\b/i.test(target)
+      ) {
+        return denyTaint(
+          "TAINT-FILE-2",
+          `Blocked reading credential path via "${exe}" while session is tainted by untrusted tool "${latestSource}".`,
+        );
+      }
     }
   }
 

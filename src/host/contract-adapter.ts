@@ -6,16 +6,21 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import type { ZodTypeAny } from "zod";
+import { z, type ZodTypeAny } from "zod";
 import { HARNESS_RELEASE_VERSION } from "../version.js";
-import { zodToJsonSchema } from "zod-to-json-schema";
 import type { GuardRequest, GuardVerdict } from "../guards/permission-guard.js";
+import {
+  extractGuardTargetFromArgs,
+  resolveExecuteRole,
+} from "../guards/permission-guard.js";
 import type { SessionEvent, SessionMessage } from "../context/context-budget.js";
 import {
   buildMuseSystemOverlay,
   captureWorkspaceDigests,
   createMutationReceipt,
+  diffNewWorkspaceFiles,
   isCompactionAgent,
+  listWorkspaceRelPaths,
   sanitizeCompactionPseudoTranscript,
 } from "../muse/muse-calibration.js";
 import {
@@ -285,18 +290,20 @@ const CODEMODE_PINNED_TOOLS = new Set([
 ]);
 
 /**
- * Convert a harness zod (v3) argument schema into a plain JSON Schema object
- * for `ToolEditor.add({ input })`. The real OpenCode V2 host
- * (`packages/core/src/tool/runtime.ts`) only accepts Effect schemas, Standard
- * JSON Schema implementations, or plain JSON Schema; zod v3 schemas are
- * rejected at registration ("Schema vendor zod does not support JSON Schema
- * conversion") and the tool silently disappears. Arguments are still
- * validated by the zod schema inside each tool's `execute`.
+ * Convert a harness zod (v4) argument schema into a plain JSON Schema object
+ * for `ToolEditor.add({ input })` via zod 4's native `z.toJSONSchema()`. The
+ * real OpenCode V2 host (`packages/core/src/tool/runtime.ts`) only accepts
+ * Effect schemas, Standard JSON Schema implementations, or plain JSON
+ * Schema; zod schemas are rejected at registration ("Schema vendor zod does
+ * not support JSON Schema conversion") and the tool silently disappears.
+ * Arguments are still validated by the zod schema inside each tool's
+ * `execute`. Shared subschemas are inlined (`reused: "inline"`) so the
+ * output never carries `$ref`/`$defs` the host cannot resolve.
  */
 export function toHostInputSchema(schema: ZodTypeAny): Record<string, unknown> {
-  const json = zodToJsonSchema(schema, {
-    target: "jsonSchema7",
-    $refStrategy: "none",
+  const json = z.toJSONSchema(schema, {
+    io: "input",
+    reused: "inline",
   }) as Record<string, unknown>;
   const { $schema: _ignored, ...rest } = json;
   return rest;
@@ -409,10 +416,44 @@ export function wireOpenCodeV2PromiseContext(params: {
     string,
     Map<string, string | null>
   >();
+  const preSubagentFileSetBySession = new Map<string, Set<string>>();
   const pendingReadSuggestions = new Map<string, string[]>();
 
   // 1. Register direct top-level tools (`options: { codemode: false }`) AND, when the host
   //    supports `editor.namespace`, also register `tools.harness.*` for Code Mode (`execute`).
+  //    Every harness `execute` is wrapped with explicit permission evaluation
+  //    (OH-6.2): the acting role comes from the execution context agent, the
+  //    tool is the registered harness name, and the path/command comes from
+  //    the raw args. Denials throw fail-closed before the tool body runs; this
+  //    never relies on host `options.permission` (upstream uses it only for
+  //    disable-ruleset filtering).
+  const guardHarnessExecute = (
+    toolName: string,
+    inner: (args: Record<string, unknown>, execCtx: unknown) => Promise<unknown>,
+  ) => {
+    return async (
+      args: Record<string, unknown>,
+      execCtx?: unknown,
+    ): Promise<{
+      content: Array<{ type: "text"; text: string }>;
+      metadata?: Record<string, unknown>;
+      [k: string]: unknown;
+    }> => {
+      const role = resolveExecuteRole(execCtx);
+      const verdict = evaluatePermission({
+        role,
+        tool: toolName,
+        ...extractGuardTargetFromArgs(args),
+      });
+      if (!verdict.allowed) {
+        throw new Error(
+          `opencode-harness: ${toolName} denied for role ${JSON.stringify(role)}: ${verdict.reason} (fail-closed)`,
+        );
+      }
+      const raw = await inner(args, execCtx);
+      return normalizePluginToolResult(raw);
+    };
+  };
   if (typeof ctx.tool?.transform === "function") {
     ctx.tool.transform((editor) => {
       for (const [name, def] of Object.entries(tools)) {
@@ -421,10 +462,9 @@ export function wireOpenCodeV2PromiseContext(params: {
           description: def.description,
           input: toHostInputSchema(def.parameters),
           options: { codemode: false },
-          execute: async (args, execCtx) => {
-            const raw = await def.execute(args, execCtx as any);
-            return normalizePluginToolResult(raw);
-          },
+          execute: guardHarnessExecute(name, (args, execCtx) =>
+            def.execute(args, execCtx as never),
+          ),
         });
       }
 
@@ -445,10 +485,9 @@ export function wireOpenCodeV2PromiseContext(params: {
               codemode: true,
               pinned: true,
             },
-            execute: async (args, execCtx) => {
-              const raw = await def.execute(args, execCtx as any);
-              return normalizePluginToolResult(raw);
-            },
+            execute: guardHarnessExecute(name, (args, execCtx) =>
+              def.execute(args, execCtx as never),
+            ),
           });
         }
       }
@@ -538,10 +577,9 @@ export function wireOpenCodeV2PromiseContext(params: {
       const sessionId = event.sessionID ?? "default";
       const firstResource = event.resources?.[0] ?? "";
       const isShell = event.action === "shell" || event.action === "bash";
+      const rawAgent = (event.agent ?? "builder").normalize("NFKC").toLowerCase().trim();
       const agentRole =
-        event.agent === "explore" || event.agent === "plan"
-          ? "director"
-          : (event.agent ?? "builder");
+        rawAgent === "explore" || rawAgent === "plan" ? "director" : rawAgent;
 
       const guardReq: GuardRequest = {
         role: agentRole,
@@ -605,6 +643,10 @@ export function wireOpenCodeV2PromiseContext(params: {
           workspaceRoot,
         );
         preSubagentDigestsBySession.set(sessionId, digests);
+        preSubagentFileSetBySession.set(
+          sessionId,
+          new Set(listWorkspaceRelPaths(workspaceRoot)),
+        );
       }
 
       if (MUTATING_FILE_TOOLS.has(toolName)) {
@@ -744,11 +786,20 @@ export function wireOpenCodeV2PromiseContext(params: {
           }
           const beforeDigests = preSubagentDigestsBySession.get(sessionId);
           preSubagentDigestsBySession.delete(sessionId);
+          const beforeFileSet = preSubagentFileSetBySession.get(sessionId);
+          preSubagentFileSetBySession.delete(sessionId);
           if (beforeDigests && ok) {
+            // Rescan against the COMPLETE pre-execution file set so created
+            // files are appended as `before="none"` entries instead of
+            // staying invisible (OH-4.8).
+            const knownSet =
+              beforeFileSet ?? new Set<string>(beforeDigests.keys());
+            const freshFiles = diffNewWorkspaceFiles(knownSet, workspaceRoot);
             const receipt = createMutationReceipt(
               outObj?.sessionID ?? sessionId,
               beforeDigests,
               workspaceRoot,
+              freshFiles,
             );
             appendedBlocks.push(receipt.formattedBlock);
             for (const changed of receipt.files.filter(

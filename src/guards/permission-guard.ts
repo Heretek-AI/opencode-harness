@@ -59,6 +59,28 @@ const LEADERSHIP_READ_ONLY_ROLES = new Set([
 
 const QA_RED_TEAM_ROLES = new Set(["qa-adversary", "agency-qa"]);
 
+/**
+ * Roles the guard recognizes. Anything else is an unknown role and is held
+ * to least privilege (reads and read-only shell only); every mutating
+ * operation from an unknown role is denied fail-closed. Roles listed in
+ * `taskOwnedPaths` are additionally recognized for the configured policy.
+ */
+const KNOWN_STANDARD_ROLES = new Set([
+  "director",
+  "manager",
+  "agency-coordinator",
+  "agency-drift-guard",
+  "qa-adversary",
+  "agency-qa",
+  "architect",
+  "programmer",
+  "developer",
+  "builder",
+  "build",
+  "explore",
+  "plan",
+]);
+
 const QA_WRITABLE_GLOBS = [
   "**/*.test.*",
   "**/*.spec.*",
@@ -96,14 +118,98 @@ const READ_TOOL_NAMES = new Set([
   "grep",
   "ls",
   "list",
+  // Harness read-only tools (never mutate files; `verify_scoped` only runs
+  // the repo's own typecheck/lint/test commands, mirroring an allowed
+  // read-only `bun test` shell for leadership).
+  "ui_geometry_audit",
+  "repo_map",
+  "blast_radius",
+  "file_outline",
+  "symbol_references",
+  "architecture_audit",
+  "verify_scoped",
+  "checkpoint_create",
+]);
+
+/**
+ * Harness tools that mutate the workspace without taking a single target
+ * path (`rename_symbol` rewrites every touched file, `checkpoint_rollback`
+ * restores snapshots). They are edit-class for leadership/QA/unknown-role
+ * purposes but exempt from the path-required rule.
+ */
+const WORKSPACE_WIDE_EDIT_TOOLS = new Set([
+  "rename_symbol",
+  "checkpoint_rollback",
 ]);
 
 export function defaultGuardConfig(): GuardPolicyConfig {
   return { lockedContractGlobs: [...DEFAULT_LOCKED_CONTRACT_GLOBS] };
 }
 
+/**
+ * Resolve the acting role for a harness tool `execute`: prefer an explicit
+ * `ctx.role`, fall back to the host `ctx.agent` (upstream `build`/`plan` /
+ * `explore` ids), and default unattributed local calls to `builder`. The
+ * read-only `explore`/`plan` agents map to `director`, mirroring the
+ * permission hook. Empty attributions also default to `builder` so local
+ * programmatic use keeps working; the `permission.evaluate` hook still
+ * enforces destructive blocks for every role.
+ */
+export function resolveExecuteRole(ctx: unknown): string {
+  const rec = (ctx ?? {}) as { role?: unknown; agent?: unknown };
+  const raw =
+    typeof rec.role === "string" && rec.role.trim() !== ""
+      ? rec.role
+      : typeof rec.agent === "string" && rec.agent.trim() !== ""
+        ? rec.agent
+        : "builder";
+  const norm = normalizeRoleName(raw);
+  if (norm === "explore" || norm === "plan") {
+    return "director";
+  }
+  return norm === "" ? "builder" : norm;
+}
+
+/**
+ * Pull the guard-relevant target out of raw tool args: the first non-empty
+ * `path`/`filePath`/`file`/`targetFile` string (or the first entry of a
+ * `files` list, e.g. `checkpoint_create`), plus a `command` string when the
+ * tool takes one. Workspace-wide tools (`rename_symbol`,
+ * `checkpoint_rollback`) intentionally yield no path; the guard judges them
+ * by tool name.
+ */
+export function extractGuardTargetFromArgs(
+  args: Record<string, unknown>,
+): { path?: string; command?: string } {
+  const source = (args ?? {}) as Record<string, unknown>;
+  const command =
+    typeof source.command === "string" && source.command.trim() !== ""
+      ? source.command
+      : undefined;
+  const pathKeys = ["path", "filePath", "file", "targetFile"] as const;
+  for (const key of pathKeys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim() !== "") {
+      return command !== undefined ? { path: value, command } : { path: value };
+    }
+  }
+  if (Array.isArray(source.files)) {
+    const first = source.files.find(
+      (entry): entry is string => typeof entry === "string" && entry.trim() !== "",
+    );
+    if (first !== undefined) {
+      return { path: first };
+    }
+  }
+  return command !== undefined ? { command } : {};
+}
+
 export function isEditTool(tool: string): boolean {
-  return EDIT_TOOL_NAMES.has(tool);
+  return EDIT_TOOL_NAMES.has(tool) || WORKSPACE_WIDE_EDIT_TOOLS.has(tool);
+}
+
+export function isWorkspaceWideEditTool(tool: string): boolean {
+  return WORKSPACE_WIDE_EDIT_TOOLS.has(tool);
 }
 
 export function isShellTool(tool: string): boolean {
@@ -162,6 +268,15 @@ function deny(reason: string, rule: string): GuardVerdict {
 }
 
 /**
+ * Normalize a role name for comparison: Unicode NFKC, lowercase, trimmed.
+ * Role matching is therefore case-insensitive (`Director` === `director`),
+ * while tool-name matching stays exact (fail-closed: `Edit`/`SHELL` deny).
+ */
+export function normalizeRoleName(role: string): string {
+  return (role ?? "").normalize("NFKC").toLowerCase().trim();
+}
+
+/**
  * Evaluate a tool/permission request against Rules 0–4 plus optional
  * per-role `taskOwnedPaths`. Unknown tool names are denied (fail-closed);
  * anything not denied by an explicit rule is allowed.
@@ -171,7 +286,7 @@ export function evaluateBoardGuard(
   config?: GuardPolicyConfig,
 ): GuardVerdict {
   const policy: GuardPolicyConfig = config ?? defaultGuardConfig();
-  const role = (request.role ?? "").trim();
+  const role = normalizeRoleName(request.role ?? "");
   const tool = (request.tool ?? "").trim();
   const path = request.path !== undefined ? normalizeGuardPath(request.path) : undefined;
   const command = request.command ?? "";
@@ -195,10 +310,12 @@ export function evaluateBoardGuard(
     );
   }
   if (isEditTool(tool) && (path === undefined || path === "")) {
-    return deny(
-      `guard: ${tool} without a target path is rejected for role ${JSON.stringify(role)} (fail-closed)`,
-      "rule-0-path-safety",
-    );
+    if (!WORKSPACE_WIDE_EDIT_TOOLS.has(tool)) {
+      return deny(
+        `guard: ${tool} without a target path is rejected for role ${JSON.stringify(role)} (fail-closed)`,
+        "rule-0-path-safety",
+      );
+    }
   }
 
   if (isShellTool(tool)) {
@@ -212,6 +329,23 @@ export function evaluateBoardGuard(
       return deny(
         `guard: destructive shell command denied for role ${JSON.stringify(role)}: ${JSON.stringify(command)}`,
         "rule-1-destructive",
+      );
+    }
+  }
+
+  // Unknown roles fail closed to least privilege: reads and read-only shell
+  // stay allowed, but every edit/write/patch and every file-mutating shell
+  // command is denied. Roles named in `taskOwnedPaths` count as known.
+  const isKnownRole =
+    KNOWN_STANDARD_ROLES.has(role) || policy.taskOwnedPaths?.[role] !== undefined;
+  if (!isKnownRole) {
+    const mutates =
+      isEditTool(tool) ||
+      (isShellTool(tool) && classifyShellCommand(command).class !== "read-only");
+    if (mutates) {
+      return deny(
+        `guard: unknown role ${JSON.stringify(request.role)} is held to least privilege; ${tool} denied (fail-closed)`,
+        "rule-0-unknown-role",
       );
     }
   }
@@ -244,6 +378,15 @@ export function evaluateBoardGuard(
         "rule-3-qa-source-lock",
       );
     }
+  }
+
+  // Workspace-wide mutations span `src/**`, which red-team roles may never
+  // touch: deny them pathlessly (fail-closed).
+  if (QA_RED_TEAM_ROLES.has(role) && WORKSPACE_WIDE_EDIT_TOOLS.has(tool)) {
+    return deny(
+      `guard: red-team role ${JSON.stringify(role)} may not run workspace-wide mutation ${tool} (fail-closed)`,
+      "rule-3-qa-source-lock",
+    );
   }
 
   const lockedGlobs =
