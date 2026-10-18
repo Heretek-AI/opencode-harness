@@ -802,12 +802,12 @@ describe("OH-4.2-post-formatter-receipt: built-in edit receipt reflects post-for
   });
 });
 
-describe("OH-1.3-stale-npm-latest: release carries the P0 fixes at 1.0.11", () => {
+describe("OH-1.3-stale-npm-latest: release carries the P0 fixes at 1.0.12", () => {
   test("package.json, src/version.ts, and the entrypoint agree past the stale 1.0.9", () => {
     expect(HARNESS_RELEASE_VERSION).toBe(pkgJson.version);
-    expect(HARNESS_RELEASE_VERSION).toBe("1.0.11");
+    expect(HARNESS_RELEASE_VERSION).toBe("1.0.12");
     expect(HARNESS_RELEASE_VERSION).not.toBe("1.0.9");
-    expect(HARNESS_RELEASE_VERSION).not.toBe("1.0.10");
+    expect(HARNESS_RELEASE_VERSION).not.toBe("1.0.11");
   });
 
   test("README title tracks the release version", () => {

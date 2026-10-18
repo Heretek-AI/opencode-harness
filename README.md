@@ -1,4 +1,4 @@
-# `@heretek-ai/opencode-harness` (`v1.0.11`)
+# `@heretek-ai/opencode-harness` (`v1.0.12`)
 
 Plugin-first OpenCode v2 in-process harness targeting **Muse 1.3** (`opencode-go/muse-spark-1.3-contributor`): zero-patch built-in tool interceptors (`edit`, `read`, `write`, `patch`, `shell`, `subagent`), post-formatter FNV-1a `<post-edit-anchors>` resync receipts, adaptive `session.hook("retry")` stream/overload recovery, cross-file relative import & named-export contract verification, lexer-safe atomic multi-file `rename_symbol`, Dual Direct + Code Mode (`tools.harness.*`) tool registration, 4-hex FNV-1a hash-anchored file edits, AST structural codemods, PageRank repository mapping, lexer-aware symbol reference & call-site search, blast-radius, circular-dependency & dead-code architecture auditing, all-or-nothing atomic transactions, warm-cached post-mutation diagnostics, stack-frame `<fault-context>` localization, head+tail anti-truncation output compaction, KV-cache-safe context budgeting, automatic circuit-breaker episodic lesson synthesis, role/path/contract/taint permission guards, a doom-loop circuit breaker, and DOM geometry auditing.
 
