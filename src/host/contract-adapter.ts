@@ -599,6 +599,7 @@ export function wireOpenCodeV2PromiseContext(params: {
         sessionId,
         firstResource,
         isShell ? "shell" : "file",
+        event,
       );
       if (taintVerdict.action === "deny") {
         event.effect = "deny";

@@ -1,4 +1,4 @@
-import { getSessionParent } from "../interceptors/session-interceptors.js";
+import { getSessionParent, linkForkLineageFromEventMetadata } from "../interceptors/session-interceptors.js";
 import { shellNamedFileTargets } from "./permission-guard.js";
 import {
   commandBasename,
@@ -235,12 +235,28 @@ export function taintEffectiveExecutable(seg: {
 /**
  * Evaluates whether a shell command or sensitive file mutation in a tainted session
  * attempts to exfiltrate credentials, pipe remote scripts to a shell, or mutate git hooks.
+ *
+ * OH-6.6-taint-fork-gap (audit-remediation-D): accepts an optional 4th param
+ * `eventContext?: unknown` carrying the live host event (permission-evaluate
+ * event, tool event, or any carrier of fork metadata). When provided, calls
+ * `linkForkLineageFromEventMetadata(sessionId, eventContext)` FIRST (never
+ * throws; unparseable/junk/self/empty values link nothing) before
+ * `resolveTaintChain`, so a forked child whose first observable event is the
+ * guarded action itself still inherits its tainted parent's taint in the same
+ * call. 3-arg callers are unaffected (no linkage attempted when the param is
+ * omitted). Residual gap: a silent host-level fork whose event carries NO
+ * fork id links nothing — hosts MUST call exported
+ * `recordSessionForkLink(child, parent)` at fork time.
  */
 export function evaluateTaintGuard(
   sessionId: string,
   commandOrPath: string,
   actionType: "shell" | "file" = "shell",
+  eventContext?: unknown,
 ): TaintVerdict {
+  if (eventContext !== undefined && eventContext !== null) {
+    linkForkLineageFromEventMetadata(sessionId, eventContext);
+  }
   const taints = resolveTaintChain(sessionId);
   if (taints.length === 0) {
     return { action: "allow" };

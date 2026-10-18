@@ -281,9 +281,13 @@ export function getSessionParent(sessionId: string): string | undefined {
  * in `session.hook("model.request")` so depth >= 2 subagents and forked child
  * sessions inherit the true root session ID without patching `affinity.ts`.
  *
- * OH-6.6-taint-fork-gap: also consult fork-metadata keys here (never
- * throws) so `model.request` links the fork even before any tool event
- * fires for the child. Silent forks stay invisible — hosts MUST call
+ * OH-6.6-taint-fork-gap (audit-remediation-D): fork-lineage linkage runs
+ * FIRST — before the headers-presence guard — so headerless `model.request`
+ * events carrying a top-level/`input`/`metadata` fork id still link
+ * (`linkForkLineageFromEventMetadata` scans the event record itself plus
+ * `input`/`metadata`/`headers` holders; never throws). Header rewrites stay
+ * guarded (headerless events link lineage and return without writing
+ * affinity headers). Silent forks stay invisible — hosts MUST call
  * `recordSessionForkLink(child, parent)` at fork time.
  */
 export function applyRootAffinityHeadersInPlace(event: {
@@ -293,6 +297,13 @@ export function applyRootAffinityHeadersInPlace(event: {
   if (!event || typeof event.sessionID !== "string" || !event.sessionID) {
     return undefined;
   }
+
+  // OH-6.6-taint-fork-gap (audit-remediation-D): link fork lineage FIRST so
+  // headerless `model.request` events carrying a top-level/`input`/`metadata`
+  // fork id still link before the headers-presence guard below. Never throws;
+  // junk/self/empty link nothing.
+  linkForkLineageFromEventMetadata(event.sessionID, event);
+
   if (!event.headers || typeof event.headers !== "object") {
     return undefined;
   }
@@ -303,10 +314,6 @@ export function applyRootAffinityHeadersInPlace(event: {
   if (headerParent) {
     recordSessionParentLink(event.sessionID, headerParent);
   }
-
-  // OH-6.6-taint-fork-gap: link fork lineage here too, so a forked child
-  // inherits taint even before its first tool event fires (never throws).
-  linkForkLineageFromEventMetadata(event.sessionID, event);
 
   const rootAffinity = resolveRootSessionAffinity(event.sessionID);
   event.headers["x-session-affinity"] = rootAffinity;

