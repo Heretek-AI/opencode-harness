@@ -129,6 +129,41 @@ those are human-only steps listed verbatim in §7.**
 - `make host-test` (networked, pinned `ed772f5`): 5 pass / 0 fail.
   (Scratch upstream copy at `/dev/shm/ochost`, outside the repo.)
 
+## Rework 1 — QA conditional ACCEPT: B1 pipeline gap (test-only fix)
+
+- **Finding:** the shipped `OH-6.7-lesson-per-read` pipeline test performed its
+  re-reads BEFORE the trip (`read-ok, edit-fail, read-ok, edit-fail,
+  good-edit-ok`), so the `=== "other"` carve-out in
+  `trackCircuitBreakerAndAutoProposeLesson` was never exercised — sabotage B1
+  (neuter the carve-out) left `bun test` 358 green while the audit-style
+  behavioral probe went RED (3 premature `via read` lessons vs pristine 1).
+- **Fix (test-only, no production logic change):**
+  `test/audit-20261018-remediation.test.ts` — extended the pipeline test to
+  the audit 4-cycle shape with POST-TRIP re-reads (`read-ok -> edit-fail ->
+  read-ok -> edit-fail -> read-ok -> read-ok -> good-edit-ok`), asserting
+  zero pending proposals after each post-trip re-read and exactly 1 pending
+  proposal attached to the good `edit` (`recoveryAction` starts with `edit`,
+  contains no `via read`, and no pending item contains `via read`).
+- **Verification (this session):**
+  - Targeted `-t "OH-6.7-lesson-per-read"` pristine → 1 pass / 0 fail.
+  - Sabotage (`"other"` → `"never-sabotaged"`) → 0 pass / 1 fail at the first
+    post-trip re-read assertion (RED confirmed), `git checkout --` restore →
+    1 pass / 0 fail.
+  - `bun run check` → exit 0; `bun test` → 358 pass / 0 fail; `make check` →
+    exit 0 (all post-change, pre-commit).
+  - Environment caveat: the shared box `/tmp` later hit 0 free inodes
+    (1048576/1048576 — other sessions' `agency-*` dirs plus completed-audit
+    scratch; only ~20 dirs are from this worktree's runs), so temp-creating
+    tests fail with `ENOSPC` on `mkdtemp` until space frees. Differential
+    re-proof with `TMPDIR=/dev/shm/oh67-tmp` (removed after): 356 pass / 2
+    fail where the ONLY failures are the two pre-existing tests that
+    hard-couple `tmpdir() === /tmp` (literal `/tmp/...` ALLOW assertions —
+    they pass under a normal `/tmp` and are unrelated to this change); the
+    extended OH-6.7 test passes and the B1 sabotage goes RED there too.
+    Full `make accept` exit 0 must be re-confirmed by QA/drift-guard once
+    `/tmp` has free inodes — no production code changed since the last green
+    `make accept`, only this test.
+
 ## Self-audit notes
 
 - **Zero stubs:** `grep TODO src/ test/` → zero hits; no `test.skip`/
@@ -178,6 +213,8 @@ OH-1.1-no-gh-release (P3), which cannot be closed from inside the sandbox.
   metadata linker + fork-aware `getSessionParent`.
 - `src/host/contract-adapter.ts` (+7): per-completion fork-link resolution.
 - `test/audit-20261018-remediation.test.ts` (+416): 15 regression tests.
+  Rework 1 extends the OH-6.7 pipeline test with post-trip re-reads (test-only;
+  production code untouched).
 - `scripts/host-test/harness-host.upstream.ts` (+271): live Formatter leg.
 - `package.json`, `src/version.ts`, `README.md`: `1.0.11` bump.
 - `docs/reports/audit-remediation-20261018.md`: this report (new).

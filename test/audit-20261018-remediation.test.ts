@@ -883,11 +883,24 @@ describe("OH-6.7-lesson-per-read: exactly one pending proposal per doom-loop", (
       status: "error",
       error: { message: "anchor mismatch" },
     };
+    // Pre-trip cycle: read-ok -> edit-fail -> read-ok -> edit-fail.
+    // The second edit-fail establishes the trip; the earlier re-reads run
+    // BEFORE the trip and must propose nothing.
     await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
     await after(failEdit as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
     await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
     await after(failEdit as never);
     expect(evaluateSession(sessionId).triggered).toBe(true);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    // Post-trip mandated re-reads: compliance, not recovery. The `other`
+    // carve-out must keep these proposal-free; neutering it emits one
+    // premature `via read` lesson per re-read here.
+    await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    await after(okRead as never);
     expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
     const goodEdit = {
       sessionID: sessionId,
@@ -903,6 +916,9 @@ describe("OH-6.7-lesson-per-read: exactly one pending proposal per doom-loop", (
     expect(pending[0]?.failedCategory).toBe("edit");
     expect(pending[0]?.recoveryAction.startsWith("edit")).toBe(true);
     expect(pending[0]?.recoveryAction).not.toContain("via read");
+    expect(pending.some((p) => p.recoveryAction.includes("via read"))).toBe(
+      false,
+    );
   });
 });
 
