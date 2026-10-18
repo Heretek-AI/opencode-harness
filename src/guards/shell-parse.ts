@@ -808,6 +808,102 @@ export function findExecPayloads(args: string[]): string[] {
   }
   return payloads;
 }
+/**
+ * Leading path operands of a `find` invocation: tokens before the first
+ * expression primary (`-…`), negation, or paren. `find` with no path
+ * defaults to `.` (safe — never a wipe root).
+ */
+function findPathOperands(args: string[]): string[] {
+  const roots: string[] = [];
+  for (const a of args) {
+    if (a === "") {
+      continue;
+    }
+    if (
+      a.startsWith("-") ||
+      a === "(" ||
+      a === ")" ||
+      a === "!" ||
+      a === ","
+    ) {
+      break;
+    }
+    if (a === ";" || a === "+" || a === "{}") {
+      break;
+    }
+    roots.push(a);
+  }
+  return roots;
+}
+
+/** Whether any leading find-path operand is a root-wipe target. */
+function findHasWipeRoot(args: string[]): boolean {
+  return findPathOperands(args).some((p) => isRootWipeTarget(p));
+}
+
+/**
+ * OH-6.5-find-exec-placeholder: `true` when an `-exec`/`-execdir`/`-ok`/
+ * `-okdir` payload runs `rm` with recursive+force flags over the `{}`
+ * placeholder (`rm -rf {}`). Callers gate this on a root-wipe find root so
+ * scoped uses (`find /tmp -name x -exec rm -rf {} \;`) stay write-class. A
+ * payload substitution (`$(…)`/backticks) with recursive+force flags is
+ * destructive because a real shell expands it before `rm` sees its targets.
+ */
+function findExecPayloadIsPlaceholderWipe(payload: string): boolean {
+  const tokens = stripLeadingWrapperTokens(
+    tokenizeSegment(canonicalizeShellCommand(payload)),
+  );
+  const subst = /`[^`]*`|\$\(/.test(payload);
+  for (let s = 0; s < tokens.length; s++) {
+    if (commandBasename(tokens[s] ?? "") !== "rm") {
+      continue;
+    }
+    let hasRecursive = false;
+    let hasForce = false;
+    let hasPlaceholder = false;
+    let endOfOptions = false;
+    for (let k = s + 1; k < tokens.length; k++) {
+      const a = tokens[k] ?? "";
+      if (!endOfOptions && a === "--") {
+        endOfOptions = true;
+        continue;
+      }
+      if (!endOfOptions && a === "--no-preserve-root") {
+        return true;
+      }
+      if (!endOfOptions && (a === "--recursive" || a === "-r" || a === "-R")) {
+        hasRecursive = true;
+        continue;
+      }
+      if (!endOfOptions && (a === "--force" || a === "-f")) {
+        hasForce = true;
+        continue;
+      }
+      if (!endOfOptions && /^-[rRf]+$/.test(a)) {
+        hasRecursive = true;
+        hasForce = true;
+        continue;
+      }
+      if (!endOfOptions && /^-[A-Za-z]+$/.test(a)) {
+        const letters = a.slice(1);
+        if (/[rR]/.test(letters)) hasRecursive = true;
+        if (letters.includes("f")) hasForce = true;
+        continue;
+      }
+      if (!endOfOptions && a.startsWith("-") && a !== "-") {
+        continue;
+      }
+      if (a === "{}") {
+        hasPlaceholder = true;
+      }
+    }
+    if (hasRecursive && hasForce && (hasPlaceholder || subst)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function parseCommandSegments(command: string, depth: number = 0): ParsedSegment[] {
   if (!command.trim()) return [];
   if (depth > MAX_SHELL_UNWRAP_DEPTH) {
@@ -1047,6 +1143,18 @@ function segmentIsDestructive(segment: string): boolean {
       );
       if (pathArgs.some((p) => p === "/" || p === "/*")) {
         return true;
+      }
+    }
+    // OH-6.5-find-exec-placeholder: `{}` expands to every path under the
+    // find root, so with a root-wipe root (`/`, `~`, `$HOME`, …) any
+    // `-exec`/`-execdir`/`-ok`/`-okdir` payload running `rm` with
+    // recursive+force flags over `{}` is a root wipe: destructive.
+    // Scoped roots stay write-class (`segmentIsWrite`).
+    if (findHasWipeRoot(args)) {
+      for (const payload of findExecPayloads(args)) {
+        if (findExecPayloadIsPlaceholderWipe(payload)) {
+          return true;
+        }
       }
     }
     return false;

@@ -274,18 +274,35 @@ export function resolveHarnessOptions(
       "opencode-harness: rootDir must be a non-empty string (fail-closed)",
     );
   }
-  const guardConfig: GuardPolicyConfig =
-    settings.guardConfig !== undefined
-      ? settings.guardConfig
-      : defaultGuardConfig();
+  const customGuardConfig =
+    settings.guardConfig !== undefined ? settings.guardConfig : undefined;
   if (
-    guardConfig === null ||
-    typeof guardConfig !== "object" ||
-    Array.isArray(guardConfig.lockedContractGlobs) === false
+    customGuardConfig !== undefined &&
+    (customGuardConfig === null ||
+      typeof customGuardConfig !== "object" ||
+      Array.isArray(customGuardConfig.lockedContractGlobs) === false)
   ) {
     throw new Error(
       "opencode-harness: guardConfig must carry a lockedContractGlobs array (fail-closed)",
     );
+  }
+  // OH-6.5-guard-root-unwired: a custom guardConfig without workspaceRoot
+  // used to fall back to process.cwd() inside resolveGuardWorkspaceRoot,
+  // over-blocking legitimate writes when rootDir !== cwd. Default the root
+  // to rootDir; an explicit non-blank workspaceRoot wins. A blank value
+  // normalizes back to rootDir so it cannot silently reintroduce the cwd
+  // fallback (fail-closed toward the operator's stated root).
+  let guardConfig: GuardPolicyConfig;
+  if (customGuardConfig === undefined) {
+    guardConfig = defaultGuardConfig();
+  } else {
+    guardConfig = { workspaceRoot: rootDir, ...customGuardConfig };
+    if (
+      typeof guardConfig.workspaceRoot !== "string" ||
+      guardConfig.workspaceRoot.trim() === ""
+    ) {
+      guardConfig.workspaceRoot = rootDir;
+    }
   }
   const budget =
     settings.contextBudgetTokens !== undefined

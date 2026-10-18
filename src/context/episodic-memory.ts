@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { normalizeToolKind } from "../guards/circuit-breaker.js";
 import type { EpisodicLesson } from "./context-budget.js";
 
 export interface EpisodicLessonProposal {
@@ -157,6 +158,17 @@ export function trackCircuitBreakerAndAutoProposeLesson(params: {
   }
 
   if (ok && ACTIVE_TRIPPED_STATE.has(sessionId)) {
+    // OH-6.7-lesson-per-read: only a NON-read success breaks the loop. The
+    // intervention text mandates a re-read of the target state before every
+    // retry, so a successful mandated re-read (`read`/`file_hash_read` — the
+    // circuit-breaker `other` kind) is compliance, not recovery: proposing a
+    // "Recovered via read" lesson on every post-trip re-read emits one
+    // premature lesson per trip while the edit that actually breaks the loop
+    // gets none. The trip state is retained so the genuine recovering edit
+    // still proposes exactly one lesson.
+    if (normalizeToolKind(toolName) === "other") {
+      return null;
+    }
     const tripState = ACTIVE_TRIPPED_STATE.get(sessionId)!;
     ACTIVE_TRIPPED_STATE.delete(sessionId);
     return proposeEpisodicLesson({

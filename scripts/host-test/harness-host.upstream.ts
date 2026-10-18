@@ -19,13 +19,53 @@ import { PluginHost } from "@opencode/core/plugin/host"
 import { PluginPromise } from "@opencode/core/plugin/promise"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Tool } from "@opencode/core/tool"
+import { Formatter } from "@opencode/core/formatter"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { AISDK } from "@opencode/core/aisdk"
+import { Command } from "@opencode/core/command"
+import { Config } from "@opencode/core/config"
+import { Credential } from "@opencode/core/credential"
+import { Database } from "@opencode/core/database/database"
+import { FileAccess } from "@opencode/core/file-access"
+import { LayerNodePlatform } from "@opencode/util/effect/app-node-platform"
+import { AppProcess } from "@opencode/util/process"
+import { Bus } from "@opencode/core/bus"
+import { FileSystem } from "@opencode/core/filesystem"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Form } from "@opencode/core/form"
+import { Generate } from "@opencode/core/generate"
+import { Integration } from "@opencode/core/integration"
+import { KV } from "@opencode/core/kv"
+import { Location } from "@opencode/core/location"
+import { ManagedPolicy } from "@opencode/core/managed-policy"
+import { Mcp } from "@opencode/core/mcp/index"
+import { Model } from "@opencode/core/model"
+import { Npm } from "@opencode/util/npm"
+import { Provider } from "@opencode/core/provider"
 import { Session } from "@opencode/schema/session"
+import { Session as CoreSession } from "@opencode/core/session"
 import { SessionMessage } from "@opencode/schema/session-message"
-import { Effect, Exit, Scope } from "effect"
+import { PersistentPty } from "@opencode/core/persistent-pty"
+import { LocationServiceMap } from "@opencode/core/location-service-map"
+import { Permission } from "@opencode/core/permission"
+import { Reference } from "@opencode/core/reference"
+import { Rpc } from "@opencode/core/rpc"
+import { Skill } from "@opencode/core/skill"
+import { SkillDiscovery } from "@opencode/core/skill/discovery"
+import { Vcs } from "@opencode/core/vcs"
+import { Watcher } from "@opencode/core/filesystem/watcher"
+import { WebSearch } from "@opencode/core/websearch"
+import { Worktree } from "@opencode/core/worktree"
+import { WorktreeStrategies } from "@opencode/core/worktree/strategies"
+import { Effect, Exit, Layer, Scope } from "effect"
 import { testEffect } from "../lib/effect"
 import { readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PluginTestLayer } from "./fixture"
+import { tempLocationLayer } from "../fixture/location"
+import { emptyMcpLayer } from "../fixture/mcp"
 
 const HARNESS_ROOT = process.env.HARNESS_ROOT
 if (!HARNESS_ROOT) throw new Error("HARNESS_ROOT must point at the opencode-harness checkout")
@@ -370,9 +410,9 @@ it.live("opencode-harness post-edit receipt matches post-write disk bytes (OH-4.
     // TS becomes formatted TS, and the `<post-edit-anchors>` receipt appended
     // by `execute.after` must equal the bytes read from disk AFTER the write
     // completes — the same ordering the built-in `edit` path relies on after
-    // upstream `Formatter.file` runs (the built-in leg is pinned at the
-    // adapter level in `test/audit-20261018-remediation.test.ts` because
-    // `PluginTestLayer` registers no built-in edit tool).
+    // upstream `Formatter.file` runs (the built-in leg runs live below in
+    // the OH-4.2 built-in-leg test with the real upstream Formatter.file;
+    // this test pins the harness-tool leg of the same ordering invariant).
     const probeName = `oh42-format-probe-${Date.now().toString(36)}.ts`
     const probeRel = probeName
     const probeAbs = join(HARNESS_ROOT, probeName)
@@ -409,6 +449,229 @@ it.live("opencode-harness post-edit receipt matches post-write disk bytes (OH-4.
       }
     } finally {
       rmSync(probeAbs, { force: true })
+    }
+  }),
+)
+
+// Test layer for the OH-4.2 built-in leg: the shared PluginTestLayer plus
+// the REAL upstream Formatter node (AppNodeBuilder wires location-scoped
+// nodes; a bare LayerNode.compile cannot bind @opencode/Location). All other
+// nodes and replacements mirror the upstream fixture exactly so harness
+// wiring behaves identically to the main suite.
+const oh42NpmLayer = Layer.succeed(
+  Npm.Service,
+  Npm.Service.of({
+    add: (name) => Effect.succeed({ directory: "", name }),
+    resolve: (name) => Effect.succeed({ directory: "", name }),
+    check: () => Effect.succeed(false),
+    update: (name) => Effect.succeed({ directory: "", name }),
+    which: () => Effect.undefined,
+  }),
+)
+
+const oh42GenerateLayer = Layer.succeed(Generate.Service, Generate.Service.of({ text: () => Effect.succeed("") }))
+
+const oh42ConfigLayer = Config.testLayer()
+
+const oh42PermissionLayer = Layer.succeed(
+  Permission.Service,
+  Permission.Service.of({
+    close: Effect.void,
+    ask: (input) => Effect.succeed({ id: input.id ?? Permission.ID.create(), effect: "ask" }),
+    assert: () => Effect.void,
+    reply: () => Effect.void,
+    get: () => Effect.succeed(undefined),
+    forSession: () => Effect.succeed([]),
+    list: () => Effect.succeed([]),
+  }),
+)
+
+const Oh42FormatterLayer = AppNodeBuilder.build(
+  LayerNode.group([
+    AppProcess.node,
+    FileSystem.node,
+    FSUtil.node,
+    Location.node,
+    Npm.node,
+    Credential.node,
+    Config.node,
+    Database.node,
+    FileAccess.node,
+    Bus.node,
+    Form.node,
+    Generate.node,
+    LayerNodePlatform.httpClient,
+    Plugin.node,
+    Agent.node,
+    AISDK.node,
+    Provider.node,
+    Model.node,
+    Command.node,
+    Integration.node,
+    KV.node,
+    ManagedPolicy.node,
+    Mcp.node,
+    CoreSession.node,
+    PersistentPty.node,
+    LocationServiceMap.node,
+    Permission.node,
+    PluginHooks.node,
+    Reference.node,
+    Rpc.node,
+    Skill.node,
+    SkillDiscovery.node,
+    Tool.node,
+    Vcs.node,
+    Watcher.node,
+    WebSearch.node,
+    Worktree.node,
+    WorktreeStrategies.node,
+    Formatter.node,
+  ]),
+  [
+    Location.node.replace(tempLocationLayer),
+    Npm.node.replace(oh42NpmLayer),
+    Config.node.replace(oh42ConfigLayer),
+    Mcp.node.replace(emptyMcpLayer),
+    Generate.node.replace(oh42GenerateLayer),
+    Permission.node.replace(oh42PermissionLayer),
+  ],
+).pipe(Layer.provideMerge(oh42ConfigLayer))
+
+const itBuiltin = testEffect(Oh42FormatterLayer)
+
+itBuiltin.live("opencode-harness built-in edit receipt matches post-Formatter.file disk bytes (OH-4.2 built-in leg)", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const tools = yield* Tool.Service
+    yield* PluginPromise.fromPromise({
+      id: harness.id,
+      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT }),
+    }).effect(yield* PluginHost.make(plugins))
+
+    const probeName = `oh42-builtin-probe-${Date.now().toString(36)}.ts`
+    const probeAbs = join(HARNESS_ROOT, probeName)
+    const oldString = "return  title;"
+    const newString = "return  title.trim();"
+    const expectedFormatted = [
+      "export function renderCard(title: string) {",
+      "  return title.trim();",
+      "}",
+    ]
+    writeFileSync(
+      probeAbs,
+      `${["export function  renderCard( title:string  )  {", oldString, "}"].join("\n")}\n`,
+      "utf8",
+    )
+
+    // Formatter runtime: the same `bun` running this test (fail-closed when
+    // unresolvable — `process.execPath` may point at an npm shim name that
+    // cannot spawn, so it is never used here).
+    const bunBin = Bun.which("bun")
+    if (!bunBin) throw new Error("OH-4.2 probe formatter requires `bun` on PATH (fail-closed)")
+
+    // Deterministic external formatter process: real bytes rewritten on disk
+    // through the REAL upstream Formatter.file code path (child-process spawn
+    // with $FILE replacement), never an in-test copy.
+    const fmtScript = join(tmpdir(), `harness-probe-fmt-${Date.now().toString(36)}.mjs`)
+    writeFileSync(
+      fmtScript,
+      [
+        `import { readFileSync, writeFileSync } from "node:fs"`,
+        `const target = process.argv[process.argv.length - 1]`,
+        `const raw = readFileSync(target, "utf8")`,
+        `const out = []`,
+        `let depth = 0`,
+        `for (const line of raw.split("\\n")) {`,
+        `  const trimmed = line.trim().replace(/[ \\t]+/g, " ").replace(/\\(\\s+/g, "(").replace(/\\s+\\)/g, ")").replace(/:(?=\\S)/g, ": ").replace(/,(?=\\S)/g, ", ").replace(/\\)\\s*\\{/g, ") {")`,
+        `  if (trimmed === "") continue`,
+        `  if (/^\\}/.test(trimmed)) depth = Math.max(0, depth - 1)`,
+        `  out.push("  ".repeat(depth) + trimmed)`,
+        `  if (/\\{$/.test(trimmed)) depth += 1`,
+        `}`,
+        `writeFileSync(target, out.join("\\n") + "\\n")`,
+        ``,
+      ].join("\n"),
+      "utf8",
+    )
+    try {
+      const formatter = yield* Formatter.Service
+      yield* formatter.transform((editor) => {
+        editor.set({
+          name: "harness-probe-tsfmt",
+          extensions: [".ts"],
+          enabled: Effect.succeed([bunBin, fmtScript, "$FILE"]),
+        })
+      })
+
+      // Built-in `edit` stand-in as a core Effect executor (direct
+      // `tools.transform` registration, like upstream's own tool tests):
+      // exact oldString→newString disk write, then the REAL upstream
+      // Formatter.file, then a disk re-read — mirroring EditTool's
+      // write → formatter.file → syncTextBom order.
+      yield* tools.transform((editor) =>
+        editor.add({
+          name: "edit",
+          description: "Built-in edit stand-in for the OH-4.2 post-format receipt probe",
+          input: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              oldString: { type: "string" },
+              newString: { type: "string" },
+            },
+            required: ["path", "oldString", "newString"],
+            additionalProperties: false,
+          },
+          options: { codemode: false, permission: "edit" },
+          execute: (input: unknown) =>
+            Effect.gen(function* () {
+              const args = input as { path: string; oldString: string; newString: string }
+              const target = join(HARNESS_ROOT, String(args.path))
+              const prev = readFileSync(target, "utf8")
+              if (!prev.includes(String(args.oldString))) {
+                return yield* new Tool.Error({
+                  message: `oldString not found in ${String(args.path)}`,
+                })
+              }
+              writeFileSync(
+                target,
+                prev.replace(String(args.oldString), String(args.newString)),
+                "utf8",
+              )
+              const didFormat: boolean = yield* formatter.file(target)
+              if (!didFormat) {
+                return yield* new Tool.Error({
+                  message: `probe formatter did not run for ${String(args.path)}`,
+                })
+              }
+              return {
+                content: [{ type: "text" as const, text: `Edited ${String(args.path)}` }],
+              }
+            }),
+        }),
+      )
+
+      const snapshot = yield* tools.snapshot()
+      const r = yield* call(snapshot, "edit", { path: probeName, oldString, newString })
+      expect(Exit.isSuccess(r)).toBe(true)
+      const body = textOf(r)
+      expect(body).toContain("<post-edit-anchors")
+      const onDisk = readFileSync(probeAbs, "utf8")
+      expect(onDisk).toBe(`${expectedFormatted.join("\n")}\n`)
+      for (const line of expectedFormatted) {
+        expect(body).toContain(`${computeLineHash(line)}| ${line}`)
+      }
+      for (const stale of [
+        "export function  renderCard( title:string  )  {",
+        "return  title;",
+        "return  title.trim();",
+      ]) {
+        expect(body).not.toContain(`${computeLineHash(stale)}| ${stale}`)
+      }
+    } finally {
+      rmSync(probeAbs, { force: true })
+      rmSync(fmtScript, { force: true })
     }
   }),
 )
