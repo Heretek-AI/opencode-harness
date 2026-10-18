@@ -56,6 +56,7 @@ import {
   calibrateSystemPromptInPlace,
   decontaminateCompactionEventInPlace,
   handleSessionRetryInPlace,
+  linkForkLineageFromEventMetadata,
   recordSessionParentLink,
   type SessionRetryEvent,
 } from "../interceptors/session-interceptors.js";
@@ -686,6 +687,12 @@ export function wireOpenCodeV2PromiseContext(params: {
       "execute.after",
       async (event: OpenCodeV2ToolAfterEvent): Promise<void> => {
         const sessionId = event.sessionID || "default";
+        // OH-6.6-taint-fork-gap: resolve fork lineage via session metadata on
+        // every tool completion. Host-level forks are invisible to the
+        // promise-plugin hook surface, so without this the forked child
+        // would shed its parent's taint on subsequent `evaluateTaintGuard`
+        // calls. Fail-closed: unparseable events link nothing.
+        linkForkLineageFromEventMetadata(sessionId, event);
         const toolName = (event.tool || "").toLowerCase();
         const failed = didToolExecutionFail(event);
         const ok = !failed;

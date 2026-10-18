@@ -144,6 +144,101 @@ export function decontaminateCompactionEventInPlace(event: {
 
 const SESSION_PARENT_MAP = new Map<string, string>();
 
+/**
+ * OH-6.6-taint-fork-gap: host-level session forks (`SessionEvent.Forked` →
+ * `projectFork`) copy tainted history into the child without emitting a
+ * promise-plugin hook the harness can observe, so no parent link is ever
+ * recorded for forks through the `recordSessionParentLink` call sites
+ * (subagent completion, affinity headers). This registry carries fork
+ * lineage explicitly: hosts and tests record it via
+ * `recordSessionForkLink` (or implicitly via
+ * `linkForkLineageFromEventMetadata`), and both lineage resolution
+ * (`getSessionParent`) and taint inheritance consult it fail-closed — a
+ * fork of a tainted session is tainted.
+ */
+const SESSION_FORK_MAP = new Map<string, string>();
+
+export function recordSessionForkLink(
+  childSessionID: string,
+  parentSessionID: string,
+): void {
+  if (
+    !childSessionID ||
+    !parentSessionID ||
+    childSessionID === parentSessionID
+  ) {
+    return;
+  }
+  SESSION_FORK_MAP.set(childSessionID, parentSessionID);
+}
+
+export function getSessionForkSource(sessionId: string): string | undefined {
+  return SESSION_FORK_MAP.get(sessionId);
+}
+
+/**
+ * Fork lineage metadata keys observed on child-session tool events. Checked
+ * on live tool events because the fork projection itself is invisible to
+ * the promise-plugin hook surface (fail-closed: only non-empty string
+ * values distinct from the child session id are honored).
+ */
+const FORK_SOURCE_METADATA_KEYS = [
+  "parentSessionID",
+  "parentSessionId",
+  "parentID",
+  "forkOf",
+  "fork_source",
+  "forkSource",
+  "sourceSessionID",
+  "sourceSessionId",
+  "forkedFrom",
+  "forkParentSessionID",
+] as const;
+
+/**
+ * OH-6.6-taint-fork-gap: resolve fork lineage via session metadata on live
+ * tool events. When a forked child session carries its source session id
+ * under a known metadata key (top-level, `input`, or `metadata`), record
+ * the fork link so subsequent `evaluateTaintGuard` calls inherit taint.
+ * Returns the linked parent session id, or `undefined` when nothing
+ * linkable is present. Never throws (fail-closed: unparseable events link
+ * nothing).
+ */
+export function linkForkLineageFromEventMetadata(
+  sessionId: string,
+  event: unknown,
+): string | undefined {
+  try {
+    if (!sessionId || event === null || typeof event !== "object") {
+      return undefined;
+    }
+    const record = event as Record<string, unknown>;
+    const holders: Array<Record<string, unknown>> = [record];
+    for (const holderKey of ["input", "metadata"] as const) {
+      const holder = record[holderKey];
+      if (holder !== null && typeof holder === "object") {
+        holders.push(holder as Record<string, unknown>);
+      }
+    }
+    for (const holder of holders) {
+      for (const key of FORK_SOURCE_METADATA_KEYS) {
+        const candidate = holder[key];
+        if (
+          typeof candidate === "string" &&
+          candidate !== "" &&
+          candidate !== sessionId
+        ) {
+          recordSessionForkLink(sessionId, candidate);
+          return candidate;
+        }
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function recordSessionParentLink(
   childSessionID: string,
   parentSessionID: string,
@@ -172,10 +267,11 @@ export function resolveRootSessionAffinity(sessionID: string): string {
 
 export function clearSessionLineage(): void {
   SESSION_PARENT_MAP.clear();
+  SESSION_FORK_MAP.clear();
 }
 
 export function getSessionParent(sessionId: string): string | undefined {
-  return SESSION_PARENT_MAP.get(sessionId);
+  return SESSION_PARENT_MAP.get(sessionId) ?? SESSION_FORK_MAP.get(sessionId);
 }
 
 /**

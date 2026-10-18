@@ -2,6 +2,7 @@ import { getSessionParent } from "../interceptors/session-interceptors.js";
 import { shellNamedFileTargets } from "./permission-guard.js";
 import {
   commandBasename,
+  isDestructiveShellCommand,
   parseCommandSegments,
   shellArgvFileTargets,
   stripLeadingWrapperTokens,
@@ -159,9 +160,9 @@ export function clearTaintState(sessionId?: string): void {
 
 /**
  * Resolve the nearest taint records for `sessionId`, walking up the
- * `recordSessionParentLink` fork/subagent/compaction chain so child sessions
- * inherit their parent's taint (fail-closed: a fork of a tainted session is
- * tainted).
+ * `recordSessionParentLink`/`recordSessionForkLink` subagent/fork/compaction
+ * chain so child sessions inherit their parent's taint (fail-closed: a fork
+ * of a tainted session is tainted; see OH-6.6-taint-fork-gap).
  */
 function resolveTaintChain(sessionId: string): TaintRecord[] {
   const visited = new Set<string>();
@@ -244,6 +245,17 @@ export function evaluateTaintGuard(
 
   const latestSource =
     taints[taints.length - 1]?.sourceTool ?? "untrusted-source";
+
+  // OH-6.5-find-exec-placeholder: while tainted, a destructive shell command
+  // (`find / -exec rm -rf {} \;`, `rm -rf /`, …) denies fail-closed at the
+  // taint layer too. The permission layer denies it for every role first,
+  // but taint must never read as `allow` for a wipe idiom.
+  if (actionType === "shell" && isDestructiveShellCommand(commandOrPath)) {
+    return denyTaint(
+      "TAINT-DESTRUCTIVE-1",
+      `Blocked destructive shell command "${commandOrPath}" while session is tainted by untrusted tool "${latestSource}".`,
+    );
+  }
 
   if (actionType === "file") {
     if (matchesTaintSensitivePath(commandOrPath)) {
