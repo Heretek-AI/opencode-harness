@@ -23,11 +23,16 @@ import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Effect, Exit, Scope } from "effect"
 import { testEffect } from "../lib/effect"
+import { readFileSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { PluginTestLayer } from "./fixture"
 
 const HARNESS_ROOT = process.env.HARNESS_ROOT
 if (!HARNESS_ROOT) throw new Error("HARNESS_ROOT must point at the opencode-harness checkout")
 const harness = (await import(`${HARNESS_ROOT}/src/index.ts`)).default
+const { computeLineHash } = (await import(`${HARNESS_ROOT}/src/index.ts`)) as {
+  computeLineHash: (line: string) => string
+}
 
 const EXPECTED_TOOLS = [
   "architecture_audit",
@@ -349,5 +354,61 @@ it.live("opencode-harness unload removes tools and hooks, reload restores exactl
     expect(countHarness((yield* tools.snapshot()).definitions)).toBe(14)
     yield* Scope.close(scope2, Exit.void)
     expect(countHarness((yield* tools.snapshot()).definitions)).toBe(0)
+  }),
+)
+
+it.live("opencode-harness post-edit receipt matches post-write disk bytes (OH-4.2 ordering)", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const tools = yield* Tool.Service
+    yield* PluginPromise.fromPromise({
+      id: harness.id,
+      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT }),
+    }).effect(yield* PluginHost.make(plugins))
+
+    // Formatting-sensitive edit through the real host pipeline: unformatted
+    // TS becomes formatted TS, and the `<post-edit-anchors>` receipt appended
+    // by `execute.after` must equal the bytes read from disk AFTER the write
+    // completes — the same ordering the built-in `edit` path relies on after
+    // upstream `Formatter.file` runs (the built-in leg is pinned at the
+    // adapter level in `test/audit-20261018-remediation.test.ts` because
+    // `PluginTestLayer` registers no built-in edit tool).
+    const probeName = `oh42-format-probe-${Date.now().toString(36)}.ts`
+    const probeRel = probeName
+    const probeAbs = join(HARNESS_ROOT, probeName)
+    const unformatted = [
+      "export function  renderCard( title:string  )  {",
+      "return  title;",
+      "}",
+    ].join("\n")
+    const formatted = [
+      "export function renderCard(title: string) {",
+      "  return title;",
+      "}",
+    ].join("\n")
+    writeFileSync(probeAbs, `${unformatted}\n`, "utf8")
+    try {
+      const snapshot = yield* tools.snapshot()
+      const r = yield* call(snapshot, "file_hash_edit", {
+        path: probeRel,
+        hunks: unformatted.split("\n").map((line, i) => ({
+          startLine: i + 1,
+          startHash: computeLineHash(unformatted.split("\n")[i] as string),
+          endLine: i + 1,
+          endHash: computeLineHash(unformatted.split("\n")[i] as string),
+          replacement: formatted.split("\n")[i] ?? "",
+        })),
+      })
+      expect(Exit.isSuccess(r)).toBe(true)
+      const body = textOf(r)
+      expect(body).toContain("<post-edit-anchors")
+      const onDisk = readFileSync(probeAbs, "utf8")
+      expect(onDisk).toContain(formatted)
+      for (const line of formatted.split("\n")) {
+        expect(body).toContain(`${computeLineHash(line)}| ${line}`)
+      }
+    } finally {
+      rmSync(probeAbs, { force: true })
+    }
   }),
 )

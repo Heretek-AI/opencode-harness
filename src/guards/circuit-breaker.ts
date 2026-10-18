@@ -10,8 +10,13 @@
  * - `shell`/`bash`-family tools fail `>= 3` consecutive times on the same
  *   command prefix (first two whitespace-separated tokens).
  *
- * "Consecutive" is a strict trailing run: any success, any different tool
- * family, or any different key (path/prefix) breaks the streak.
+ * "Consecutive" is a strict trailing run with one OH-6.7 carve-out: the
+ * edit streak keys on consecutive edit *failures on one path* regardless of
+ * interleaving compliant successful `read`/`file_hash_read` re-reads (the
+ * `checkStaleFileRead` contract mandates a re-read before every retry, so
+ * counting those successes against the streak made the breaker unreachable
+ * through the only compliant retry loop). Any edit success, any failed read,
+ * any shell-family attempt, or any different path still breaks the streak.
  */
 
 export const EDIT_FAILURE_THRESHOLD = 2;
@@ -149,7 +154,18 @@ export function evaluateSession(sessionId: string): CircuitBreakerVerdict {
   let streak = 0;
   for (let index = attempts.length - 1; index >= 0; index--) {
     const attempt = attempts[index];
-    if (attempt.ok || normalizeToolKind(attempt.tool) !== kind) {
+    const attemptKind = normalizeToolKind(attempt.tool);
+    if (kind === "edit" && attemptKind === "other") {
+      // OH-6.7-edit-breaker-unreachable: compliant successful re-reads
+      // (`read`, `file_hash_read` — kind `other`) mandated by
+      // `checkStaleFileRead` never count against the edit streak. A failed
+      // read is not a compliant re-read and still breaks the streak.
+      if (attempt.ok) {
+        continue;
+      }
+      break;
+    }
+    if (attempt.ok || attemptKind !== kind) {
       break;
     }
     const candidateKey = kind === "edit" ? editKeyOf(attempt) : shellKeyOf(attempt);

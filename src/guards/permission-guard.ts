@@ -8,6 +8,10 @@
  *
  * Rule order (first match wins, all denials fail closed):
  * - Rule 0 (Path safety): absolute paths and `..` traversal are denied.
+ *   Shell named-file targets (redirects, `tee`, `cp`/`mv`/`ln`/`install`
+ *   operands, `sed -i` files) are confined to the workspace root (or the OS
+ *   temp-dir scratch space) for every role
+ *   (`rule-0-shell-target-containment`, OH-6.5-redirect-escape).
  * - Rule 1 (Destructive Command Block): `rm -rf /`, `rm -rf *`,
  *   `git reset --hard`, `git push --force`, `mkfs`, `dd if=` denied for
  *   ALL roles.
@@ -31,7 +35,10 @@
 import {
   classifyShellCommand,
   isDestructiveShellCommand,
+  shellArgvFileTargets,
 } from "./shell-parse.js";
+import { tmpdir } from "node:os";
+import { isAbsolute, resolve, sep } from "node:path";
 
 export const DEFAULT_LOCKED_CONTRACT_GLOBS: string[] = [
   "**/contracts/**",
@@ -41,6 +48,14 @@ export const DEFAULT_LOCKED_CONTRACT_GLOBS: string[] = [
 export interface GuardPolicyConfig {
   lockedContractGlobs: string[];
   taskOwnedPaths?: Record<string, string[]>;
+  /**
+   * OH-6.5-redirect-escape: workspace root shell redirect/argv targets are
+   * confined to. Relative targets resolve under it; absolute targets must
+   * land inside it (or inside the OS temp dir, the legitimate builder
+   * scratch space for `> /tmp/…/artifact.txt`). Defaults to
+   * `process.cwd()` when absent so programmatic callers keep working.
+   */
+  workspaceRoot?: string;
 }
 
 export interface GuardRequest {
@@ -431,6 +446,89 @@ export function shellNamedFileTargets(command: string): string[] {
   return out;
 }
 
+/**
+ * Union of `shellNamedFileTargets` and `shellArgvFileTargets` — every named
+ * file a shell command can create, overwrite, or move (redirects, `tee`,
+ * `cp`/`mv`/`ln`/`install` operands, `sed -i` files). The Rule-0 shell
+ * target gate runs every entry through `shellTargetEscapesWorkspace`.
+ */
+export function shellAllFileTargets(command: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const target of [...shellNamedFileTargets(command), ...shellArgvFileTargets(command)]) {
+    if (!seen.has(target)) {
+      seen.add(target);
+      out.push(target);
+    }
+  }
+  return out;
+}
+
+function resolveGuardWorkspaceRoot(policy: GuardPolicyConfig): string {
+  const raw = policy.workspaceRoot;
+  if (typeof raw === "string" && raw.trim() !== "") {
+    return resolve(raw);
+  }
+  return resolve(process.cwd());
+}
+
+function isPathWithinRoot(absTarget: string, absRoot: string): boolean {
+  if (absTarget === absRoot) {
+    return true;
+  }
+  const root = absRoot.endsWith(sep) ? absRoot : absRoot + sep;
+  return absTarget.startsWith(root);
+}
+
+/**
+ * OH-6.5-redirect-escape / OH-6.5-cp-mv-argv-targets: `true` when a shell
+ * named-file target escapes the workspace root (absolute outside the root
+ * and outside the OS temp dir, `..` traversal resolving outside, NUL bytes,
+ * drive-letter paths, `~` home expansion). Relative targets resolve under
+ * the workspace root. `fd`-redirect markers (`-`, `/dev/null`) are not file
+ * targets and never escape. Fail-closed: anything unresolvable escapes.
+ */
+export function shellTargetEscapesWorkspace(target: string, workspaceRoot: string): boolean {
+  if (typeof target !== "string") {
+    return true;
+  }
+  const trimmed = target.trim();
+  if (trimmed === "" || trimmed.includes(String.fromCharCode(0))) {
+    return true;
+  }
+  if (trimmed === "-" || trimmed === "/dev/null") {
+    return false;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
+    return true;
+  }
+  if (trimmed === "~" || trimmed.startsWith("~/")) {
+    return true;
+  }
+  let abs: string;
+  let absoluteTarget: boolean;
+  try {
+    absoluteTarget = isAbsolute(trimmed);
+    abs = absoluteTarget ? resolve(trimmed) : resolve(workspaceRoot, trimmed);
+  } catch {
+    return true;
+  }
+  if (absoluteTarget) {
+    // Legitimate builder scratch (`> /tmp/…/artifact.txt`): explicit
+    // absolute paths inside the OS temp dir are allowed. Relative `..`
+    // escapes that merely land in the temp dir are still escapes — only
+    // absolute targets earn the temp-dir allowance.
+    try {
+      if (isPathWithinRoot(abs, resolve(tmpdir()))) {
+        return false;
+      }
+    } catch {
+      // Fall through to the workspace check when the temp dir is unreadable.
+    }
+  }
+  return !isPathWithinRoot(abs, resolve(workspaceRoot));
+}
+
 function deny(reason: string, rule: string): GuardVerdict {
   return { allowed: false, reason, rule };
 }
@@ -492,6 +590,20 @@ export function evaluateBoardGuard(
         `guard: empty shell command is rejected for role ${JSON.stringify(role)} (fail-closed)`,
         "rule-0-path-safety",
       );
+    }
+    // OH-6.5-redirect-escape / OH-6.5-cp-mv-argv-targets: every named file
+    // a shell command can create, overwrite, or move (redirects, `tee`,
+    // `cp`/`mv`/`ln`/`install` operands, `sed -i` files) must stay inside
+    // the workspace root (or the OS temp-dir scratch space) for EVERY role
+    // — before any other shell rule, fail-closed.
+    const workspaceRoot = resolveGuardWorkspaceRoot(policy);
+    for (const target of shellAllFileTargets(command)) {
+      if (shellTargetEscapesWorkspace(target, workspaceRoot)) {
+        return deny(
+          `guard: shell target ${JSON.stringify(target)} escapes the workspace root ${JSON.stringify(workspaceRoot)} (fail-closed)`,
+          "rule-0-shell-target-containment",
+        );
+      }
     }
     if (isDestructiveShellCommand(command)) {
       return deny(

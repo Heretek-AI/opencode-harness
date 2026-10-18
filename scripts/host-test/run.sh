@@ -9,6 +9,9 @@ set -euo pipefail
 
 HARNESS_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # Pinned upstream dev commit the host contract was verified against.
+# OH-8.2-install-story: this pin is the minimum supported host — the same
+# commit is documented in README.md "Requirements". Advance both in one
+# change and re-run `make host-test` at the old pin and the new head.
 OPENCODE_REF="${OPENCODE_REF:-ed772f5009755b5262805a7ba07e66e1417f140a}"
 OPENCODE_REPO="${OPENCODE_REPO:-https://github.com/anomalyco/opencode.git}"
 

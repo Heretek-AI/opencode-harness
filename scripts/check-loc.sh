@@ -16,7 +16,33 @@
 #   and DOM geometry auditing across 8 waves — roughly 22 modules where the
 #   blueprint assumed a handful. The overage is authorized scope growth, and
 #   further growth is tracked here rather than budgeted by deletion.
+#
+# OH-scope-loc-budget: by default this script is a tracking signal (exit 0).
+# Pass `--fail-over=<n>` (and/or `--fail-over-stripped=<n>`) to turn the
+# corresponding budget into a hard gate that exits non-zero over cap — CI
+# wires the gate form so unchecked growth fails the build.
 set -euo pipefail
+
+FAIL_OVER_RAW=""
+FAIL_OVER_STRIPPED=""
+for arg in "$@"; do
+  case "$arg" in
+    --fail-over=*)
+      FAIL_OVER_RAW="${arg#--fail-over=}"
+      ;;
+    --fail-over-stripped=*)
+      FAIL_OVER_STRIPPED="${arg#--fail-over-stripped=}"
+      ;;
+    --fail-over)
+      echo "loc-budget: --fail-over requires =<n> (fail-closed)" >&2
+      exit 2
+      ;;
+    *)
+      echo "loc-budget: unknown argument ${arg} (fail-closed)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARNESS_ROOT"
@@ -39,5 +65,32 @@ if [[ "$stripped" -gt "$STRIPPED_BUDGET" ]]; then
   echo "loc-budget WARNING: stripped LOC $stripped exceeds revised budget $STRIPPED_BUDGET (tracking only, not failing)" >&2
   status=0
 fi
+
+# Hard-cap gate form (OH-scope-loc-budget): exits non-zero over cap.
+if [[ -n "$FAIL_OVER_RAW" ]]; then
+  if ! [[ "$FAIL_OVER_RAW" =~ ^[0-9]+$ ]]; then
+    echo "loc-budget: --fail-over cap must be a non-negative integer, got ${FAIL_OVER_RAW} (fail-closed)" >&2
+    exit 2
+  fi
+  if [[ "$raw" -gt "$FAIL_OVER_RAW" ]]; then
+    echo "loc-budget FAIL: raw LOC $raw exceeds hard cap $FAIL_OVER_RAW" >&2
+    status=1
+  else
+    echo "loc-budget: raw LOC $raw within hard cap $FAIL_OVER_RAW"
+  fi
+fi
+if [[ -n "$FAIL_OVER_STRIPPED" ]]; then
+  if ! [[ "$FAIL_OVER_STRIPPED" =~ ^[0-9]+$ ]]; then
+    echo "loc-budget: --fail-over-stripped cap must be a non-negative integer, got ${FAIL_OVER_STRIPPED} (fail-closed)" >&2
+    exit 2
+  fi
+  if [[ "$stripped" -gt "$FAIL_OVER_STRIPPED" ]]; then
+    echo "loc-budget FAIL: stripped LOC $stripped exceeds hard cap $FAIL_OVER_STRIPPED" >&2
+    status=1
+  else
+    echo "loc-budget: stripped LOC $stripped within hard cap $FAIL_OVER_STRIPPED"
+  fi
+fi
+
 echo "loc-budget: tracked (exit $status)"
 exit "$status"

@@ -1,5 +1,12 @@
 import { getSessionParent } from "../interceptors/session-interceptors.js";
-import { commandBasename, parseCommandSegments } from "./shell-parse.js";
+import { shellNamedFileTargets } from "./permission-guard.js";
+import {
+  commandBasename,
+  parseCommandSegments,
+  shellArgvFileTargets,
+  stripLeadingWrapperTokens,
+  UNRESOLVED_NESTING_SENTINEL,
+} from "./shell-parse.js";
 
 export interface TaintRecord {
   sessionId: string;
@@ -175,6 +182,53 @@ function denyTaint(ruleId: string, reason: string): TaintVerdict {
 }
 
 /**
+ * OH-6.6-redirect-taint-blindspot: `true` when a path (file-tool target or
+ * shell redirect/`tee`/argv target) names a credential or hook location the
+ * tainted session must not touch. Shared by the `file` branch and the shell
+ * branch so the two layers cannot diverge.
+ */
+export function matchesTaintSensitivePath(commandOrPath: string): boolean {
+  const norm = (commandOrPath ?? "").replace(/\\/g, "/");
+  const lower = norm.toLowerCase();
+  return (
+    norm.includes(".git/hooks") ||
+    norm.includes(".git/config") ||
+    /(^|\/)\.ssh(\/|$)/.test(norm) ||
+    norm.includes(".aws/") ||
+    /(^|\/)(\.env)(\.[^/]*)?$/.test(lower) ||
+    norm.endsWith(".bashrc") ||
+    norm.endsWith(".zshrc") ||
+    norm.endsWith(".profile")
+  );
+}
+
+/**
+ * OH-6.6-exec-taint-evasion: the effective executable of one parsed segment
+ * after stripping privilege/env wrappers (`exec`, `timeout 5`, `sudo -u
+ * root`, …) with the shared G-01 wrapper set. Falls back to the raw segment
+ * executable (then the wrapper chain tail) when stripping yields nothing.
+ */
+export function taintEffectiveExecutable(seg: {
+  tokens: string[];
+  executable: string;
+  wrapperChain?: string[];
+}): string {
+  const stripped = stripLeadingWrapperTokens(seg.tokens ?? []);
+  const head = (stripped.filter((t) => t !== UNRESOLVED_NESTING_SENTINEL))[0] ?? "";
+  if (head !== "") {
+    return commandBasename(head);
+  }
+  // Bare wrapper with no payload (`env` alone prints the environment):
+  // the raw command word still identifies the taint-relevant behavior.
+  const direct = commandBasename(seg.executable ?? "");
+  if (direct !== "") {
+    return direct;
+  }
+  const chain = seg.wrapperChain ?? [];
+  return chain.length > 0 ? commandBasename(chain[chain.length - 1] ?? "") : "";
+}
+
+/**
  * Evaluates whether a shell command or sensitive file mutation in a tainted session
  * attempts to exfiltrate credentials, pipe remote scripts to a shell, or mutate git hooks.
  */
@@ -192,18 +246,7 @@ export function evaluateTaintGuard(
     taints[taints.length - 1]?.sourceTool ?? "untrusted-source";
 
   if (actionType === "file") {
-    const norm = commandOrPath.replace(/\\/g, "/");
-    const lower = norm.toLowerCase();
-    if (
-      norm.includes(".git/hooks") ||
-      norm.includes(".git/config") ||
-      /(^|\/)\.ssh(\/|$)/.test(norm) ||
-      norm.includes(".aws/") ||
-      /(^|\/)\.env(\.[^/]*)?$/.test(lower) ||
-      norm.endsWith(".bashrc") ||
-      norm.endsWith(".zshrc") ||
-      norm.endsWith(".profile")
-    ) {
+    if (matchesTaintSensitivePath(commandOrPath)) {
       return denyTaint(
         "TAINT-FILE-1",
         `Blocked mutation of sensitive credential/hook path "${commandOrPath}" while session is tainted by untrusted tool "${latestSource}".`,
@@ -212,15 +255,25 @@ export function evaluateTaintGuard(
     return { action: "allow" };
   }
 
-  const segments = parseCommandSegments(commandOrPath);
-  const effectiveExes = segments.map((seg) => {
-    const direct = commandBasename(seg.executable);
-    if (direct !== "") {
-      return direct;
+  // OH-6.6-redirect-taint-blindspot: while tainted, a shell redirect/`tee`
+  // (or `cp`/`mv`/`ln`/`install`/`sed -i` argv) target naming a sensitive
+  // credential/hook path denies with TAINT-FILE-1 — the permission guard is
+  // the wrong layer to rely on here because tainted privileged roles
+  // (`architect`, `builder`) pass it by design.
+  for (const target of [
+    ...shellNamedFileTargets(commandOrPath),
+    ...shellArgvFileTargets(commandOrPath),
+  ]) {
+    if (matchesTaintSensitivePath(target)) {
+      return denyTaint(
+        "TAINT-FILE-1",
+        `Blocked shell redirect target "${target}" (sensitive credential/hook path) while session is tainted by untrusted tool "${latestSource}".`,
+      );
     }
-    const chain = seg.wrapperChain ?? [];
-    return chain.length > 0 ? commandBasename(chain[chain.length - 1] ?? "") : "";
-  });
+  }
+
+  const segments = parseCommandSegments(commandOrPath);
+  const effectiveExes = segments.map((seg) => taintEffectiveExecutable(seg));
   const exeSet = new Set(effectiveExes);
   const hasFetcher = exeSet.has("curl") || exeSet.has("wget");
   const hasShellTarget =
@@ -239,9 +292,7 @@ export function evaluateTaintGuard(
   }
 
   for (const seg of segments) {
-    const exe = commandBasename(seg.executable) !== ""
-      ? commandBasename(seg.executable)
-      : commandBasename((seg.wrapperChain ?? [])[(seg.wrapperChain ?? []).length - 1] ?? "");
+    const exe = taintEffectiveExecutable(seg);
     const joinedArgs = seg.args.join(" ");
 
     // `wget` writes remote content to disk silently: deny when tainted.

@@ -65,6 +65,9 @@ step "P2 OH-1.4 bun run accept entrypoint"
 test -x scripts/accept/run.sh || fail "scripts/accept/run.sh missing or not executable"
 bun run accept || fail "bun run accept"
 
+step "audit-remediation regression suite (AUDIT_REPORT_FINDINGS.md OH-1.3..OH-4.2)"
+bun test test/audit-20261018-remediation.test.ts || fail "audit-20261018-remediation suite"
+
 step "full unit suite"
 bun test || fail "bun test"
 
