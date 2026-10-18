@@ -62,6 +62,8 @@
  *   consumed as option values but never reported as file targets.
  */
 
+import { posix } from "node:path";
+
 export type ShellCommandClass = "read-only" | "write" | "destructive";
 
 export interface ParsedShellCommand {
@@ -838,14 +840,21 @@ function findPathOperands(args: string[]): string[] {
 
 /** Whether any leading find-path operand is a root-wipe target. */
 function findHasWipeRoot(args: string[]): boolean {
-  return findPathOperands(args).some((p) => isRootWipeTarget(p));
+  return findPathOperands(args).some((p) => isFindWipeRootOperand(p));
+}
+
+/** Leading `find` path operand naming a wipe root (`//`, `/tmp/../`, `..`, `~root`). */
+function isFindWipeRootOperand(operand: string): boolean {
+  const t = (operand ?? "").trim();
+  return t !== "" && (isRootWipeTarget(t) || t.replace(/\\/g, "/").split("/").includes(".."));
 }
 
 /**
- * OH-6.5-find-exec-placeholder: `true` when an `-exec`/`-execdir`/`-ok`/
- * `-okdir` payload runs `rm` with recursive+force flags over the `{}`
- * placeholder (`rm -rf {}`). Callers gate this on a root-wipe find root so
- * scoped uses (`find /tmp -name x -exec rm -rf {} \;`) stay write-class. A
+ * OH-6.5-find-exec-placeholder (+ OH-6.5-embedded-placeholder): `true` when
+ * an `-exec`/`-execdir`/`-ok`/`-okdir` payload runs `rm` with recursive+force
+ * flags over a `{}-including` target (`{}`, `{}/foo`, `{}foo`, `prefix{}` —
+ * substring match, fail-closed). Callers gate this on a wipe-root find root
+ * so scoped uses (`find /tmp -name x -exec rm -rf {} \;`) stay write-class. A
  * payload substitution (`$(…)`/backticks) with recursive+force flags is
  * destructive because a real shell expands it before `rm` sees its targets.
  */
@@ -893,7 +902,7 @@ function findExecPayloadIsPlaceholderWipe(payload: string): boolean {
       if (!endOfOptions && a.startsWith("-") && a !== "-") {
         continue;
       }
-      if (a === "{}") {
+      if (a.includes("{}")) {
         hasPlaceholder = true;
       }
     }
@@ -964,21 +973,34 @@ function splitChain(command: string): string[] {
     .filter((part) => part.length > 0);
 }
 
+/** Fail-closed wipe-target normalization (`//`→`/`, `/tmp/../`→`/`, `~…`→`/`, `$HOME`→`/`). */
+function normalizeWipeTarget(target: string): string {
+  const s = (target ?? "").trim();
+  if (s.startsWith("~")) return "/";
+  try {
+    return posix.normalize(s.replace(/\$\{HOME\}|\$HOME/g, "/").replace(/\/+/g, "/"));
+  } catch {
+    return s;
+  }
+}
+
 /** Targets whose recursive-force removal wipes a home/root scope. */
 function isRootWipeTarget(target: string): boolean {
-  return (
-    target === "/" ||
-    target === "/*" ||
-    target === "*" ||
-    target === "--no-preserve-root" ||
-    target === "~" ||
-    target === "~/*" ||
-    target.startsWith("~/") ||
-    target === "$HOME" ||
-    target === "${HOME}" ||
-    target.startsWith("$HOME/") ||
-    target.startsWith("${HOME}/")
-  );
+  const t = (target ?? "").trim();
+  if (t === "*" || t === "/*" || t === "--no-preserve-root") {
+    return true;
+  }
+  if (t.startsWith("~")) {
+    return true; // `~`, `~/…`, `~<user>` fail closed
+  }
+  if (t === "$HOME" || t === "${HOME}") {
+    return true;
+  }
+  if (t.startsWith("$HOME/") || t.startsWith("${HOME}/")) {
+    return true;
+  }
+  // Normalized `/` covers `//`, `///`, `/.`, `/./`, `/../`, `/tmp/../`.
+  return normalizeWipeTarget(t) === "/";
 }
 
 /**
@@ -1135,13 +1157,11 @@ function segmentIsDestructive(segment: string): boolean {
   }
 
   if (exe === "find") {
-    // `find / -delete` removes the whole tree: destructive. Scoped deletes
-    // (`find /tmp/x -delete`) stay write-class via `segmentIsWrite`.
+    // `find / -delete` removes the whole tree: destructive, as do the
+    // normalized/escaping spellings (`//`, `/tmp/../`, `..`, `~root`).
+    // Scoped deletes (`find /tmp/x -delete`) stay write-class.
     if (args.includes("-delete")) {
-      const pathArgs = args.filter(
-        (a) => !a.startsWith("-") && a !== ";" && a !== "+" && a !== "{}",
-      );
-      if (pathArgs.some((p) => p === "/" || p === "/*")) {
+      if (findPathOperands(args).some((p) => isFindWipeRootOperand(p))) {
         return true;
       }
     }

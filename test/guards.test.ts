@@ -20,6 +20,11 @@ import {
   isDestructiveShellCommand,
   isFileMutatingShellCommand,
 } from "../src/guards/shell-parse";
+import {
+  clearTaintState,
+  evaluateTaintGuard,
+  recordUntrustedContentTaint,
+} from "../src/guards/taint-guard";
 
 function verdict(request: GuardRequest) {
   return evaluateBoardGuard(request, defaultGuardConfig());
@@ -376,6 +381,170 @@ describe("permission-guard staff roles (OH-8.3)", () => {
       expect(verdict({ role, tool: "shell", command: "rm -rf /" }).allowed).toBe(false);
       expect(verdict({ role, tool: "edit", path: "api/contracts/v1.json" }).allowed).toBe(false);
       expect(verdict({ role, tool: "edit", path: "src/x.ts" }).rule).toBe(undefined);
+    }
+  });
+});
+
+describe("OH-6.5-root-normalization: slash/dot-dot/tilde wipe-root spellings are destructive (P0)", () => {
+  const ATTACK_ROLES = ["builder", "architect", "director", "qa-adversary"];
+
+  test("rm -rf over normalized wipe roots is destructive for every role", () => {
+    for (const command of [
+      "rm -rf //",
+      "rm -rf ///",
+      "rm -rf /.",
+      "rm -rf /./",
+      "rm -rf /../",
+      "rm -rf /tmp/../",
+      "rm -rf ~root",
+      "rm -rf ~root/.ssh",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("destructive");
+      expect(isDestructiveShellCommand(command)).toBe(true);
+      for (const role of ATTACK_ROLES) {
+        const result = verdict({ role, tool: "shell", command });
+        expect(result.allowed).toBe(false);
+        expect(result.rule).toBe("rule-1-destructive");
+      }
+    }
+  });
+
+  test("find -exec placeholder wipe over normalized/escaping roots is destructive for every role", () => {
+    for (const command of [
+      "find // -exec rm -rf {} \\;",
+      "find /./ -exec rm -rf {} \\;",
+      "find /tmp/../ -exec rm -rf {} \\;",
+      "find .. -exec rm -rf {} \\;",
+      "find ~root -exec rm -rf {} \\;",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("destructive");
+      expect(isDestructiveShellCommand(command)).toBe(true);
+      for (const role of ATTACK_ROLES) {
+        const result = verdict({ role, tool: "shell", command });
+        expect(result.allowed).toBe(false);
+        expect(result.rule).toBe("rule-1-destructive");
+      }
+    }
+  });
+
+  test("find -delete over normalized/escaping roots is destructive for every role", () => {
+    for (const command of ["find // -delete", "find /tmp/../ -delete", "find .. -delete"]) {
+      expect(classifyShellCommand(command).class).toBe("destructive");
+      expect(isDestructiveShellCommand(command)).toBe(true);
+      for (const role of ATTACK_ROLES) {
+        const result = verdict({ role, tool: "shell", command });
+        expect(result.allowed).toBe(false);
+        expect(result.rule).toBe("rule-1-destructive");
+      }
+    }
+  });
+
+  test("tainted sessions deny every root-normalization probe at the taint layer", () => {
+    const session = `oh65-root-norm-taint-${Date.now()}`;
+    const commands = [
+      "rm -rf //",
+      "rm -rf ///",
+      "rm -rf /.",
+      "rm -rf /./",
+      "rm -rf /../",
+      "rm -rf /tmp/../",
+      "rm -rf ~root",
+      "rm -rf ~root/.ssh",
+      "find // -exec rm -rf {} \\;",
+      "find /./ -exec rm -rf {} \\;",
+      "find /tmp/../ -exec rm -rf {} \\;",
+      "find .. -exec rm -rf {} \\;",
+      "find ~root -exec rm -rf {} \\;",
+      "find // -delete",
+      "find /tmp/../ -delete",
+      "find .. -delete",
+    ];
+    for (const command of commands) {
+      recordUntrustedContentTaint(session, "webfetch");
+      const tainted = evaluateTaintGuard(session, command, "shell");
+      expect(tainted.action).toBe("deny");
+      expect(tainted.ruleId).toBe("TAINT-DESTRUCTIVE-1");
+      clearTaintState(session);
+    }
+  });
+
+  test("scoped controls stay write-class and allowed for builder", () => {
+    for (const command of [
+      "rm -rf /tmp",
+      "rm -rf /tmp/wave1-abcd",
+      "rm -rf /var/tmp/app",
+      "find /tmp -name x -exec rm -rf {} \\;",
+      "find /tmp -name x -exec rm -rf {}/foo \\;",
+      "find . -exec rm -rf {} \\;",
+      "find . -exec rm -rf {}/foo \\;",
+      "find /tmp -name x -delete",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("write");
+      expect(isDestructiveShellCommand(command)).toBe(false);
+      expect(verdict({ role: "builder", tool: "shell", command }).allowed).toBe(true);
+    }
+  });
+});
+
+describe("OH-6.5-embedded-placeholder: suffixed/embedded {} is a placeholder wipe (P1)", () => {
+  const ATTACK_ROLES = ["builder", "architect", "director", "qa-adversary"];
+
+  test("embedded {} payloads over / are destructive for every role", () => {
+    for (const command of [
+      "find / -exec rm -rf {}/foo \\;",
+      "find / -exec rm -rf {}foo \\;",
+      "find / -exec rm -rf prefix{} \\;",
+      "find / -exec rm -rf -- {}/foo \\;",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("destructive");
+      expect(isDestructiveShellCommand(command)).toBe(true);
+      for (const role of ATTACK_ROLES) {
+        const result = verdict({ role, tool: "shell", command });
+        expect(result.allowed).toBe(false);
+        expect(result.rule).toBe("rule-1-destructive");
+      }
+    }
+  });
+
+  test("embedded {} also denies with -ok terminators", () => {
+    for (const command of [
+      "find / -ok rm -rf {}/foo \\;",
+      "find / -ok rm -rf {}foo \\;",
+      "find / -ok rm -rf prefix{} \\;",
+    ]) {
+      expect(isDestructiveShellCommand(command)).toBe(true);
+      for (const role of ATTACK_ROLES) {
+        const result = verdict({ role, tool: "shell", command });
+        expect(result.allowed).toBe(false);
+        expect(result.rule).toBe("rule-1-destructive");
+      }
+    }
+  });
+
+  test("tainted sessions deny embedded {} wipes at the taint layer", () => {
+    const session = `oh65-embedded-taint-${Date.now()}`;
+    for (const command of [
+      "find / -exec rm -rf {}/foo \\;",
+      "find / -exec rm -rf {}foo \\;",
+      "find / -exec rm -rf prefix{} \\;",
+      "find / -exec rm -rf -- {}/foo \\;",
+    ]) {
+      recordUntrustedContentTaint(session, "webfetch");
+      const tainted = evaluateTaintGuard(session, command, "shell");
+      expect(tainted.action).toBe("deny");
+      expect(tainted.ruleId).toBe("TAINT-DESTRUCTIVE-1");
+      clearTaintState(session);
+    }
+  });
+
+  test("scoped embedded-{} controls stay write-class and allowed", () => {
+    for (const command of [
+      "find /tmp -name x -exec rm -rf {}/foo \\;",
+      "find . -name x -exec rm -rf {}/foo \\;",
+    ]) {
+      expect(classifyShellCommand(command).class).toBe("write");
+      expect(isDestructiveShellCommand(command)).toBe(false);
+      expect(verdict({ role: "builder", tool: "shell", command }).allowed).toBe(true);
     }
   });
 });
