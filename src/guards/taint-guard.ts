@@ -162,7 +162,10 @@ export function clearTaintState(sessionId?: string): void {
  * Resolve the nearest taint records for `sessionId`, walking up the
  * `recordSessionParentLink`/`recordSessionForkLink` subagent/fork/compaction
  * chain so child sessions inherit their parent's taint (fail-closed: a fork
- * of a tainted session is tainted; see OH-6.6-taint-fork-gap).
+ * of a tainted session is tainted; a forged clean-parent link allows
+ * exactly like no link). Residual gap: silent host-level forks (no
+ * promise-plugin hook event) link nothing — hosts MUST call exported
+ * `recordSessionForkLink(child, parent)` at fork time.
  */
 function resolveTaintChain(sessionId: string): TaintRecord[] {
   const visited = new Set<string>();

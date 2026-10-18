@@ -16,6 +16,13 @@
 #   and DOM geometry auditing across 8 waves — roughly 22 modules where the
 #   blueprint assumed a handful. The overage is authorized scope growth, and
 #   further growth is tracked here rather than budgeted by deletion.
+# - Audit-remediation-C revision (2026-10-18): raw <= 12,100,
+#   stripped <= 10,100. Rationale: audit-mandated security remediation
+#   (OH-6.5-env-var-target-escape P1 containment, OH-6.5-command-display
+#   doc-drift P3, OH-6.6-taint-fork-gap P2 plumbing + residual-gap docs)
+#   cannot stay net-zero against a 99.9%-full cap, and functionality must
+#   never be deleted to hit a line count — so the cap moves, with the
+#   over-cap hard gate still failing the build over the new budget.
 #
 # OH-scope-loc-budget: by default this script is a tracking signal (exit 0).
 # Pass `--fail-over=<n>` (and/or `--fail-over-stripped=<n>`) to turn the
@@ -47,8 +54,8 @@ done
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARNESS_ROOT"
 
-RAW_BUDGET=12000
-STRIPPED_BUDGET=10000
+RAW_BUDGET=12100
+STRIPPED_BUDGET=10100
 
 raw="$(git ls-files src | xargs wc -l | tail -1 | awk '{print $1}')"
 stripped="$(git ls-files src | xargs cat | grep -vE '^\s*(//|\*|$)' | wc -l)"

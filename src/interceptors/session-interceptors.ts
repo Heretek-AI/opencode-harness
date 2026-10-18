@@ -155,6 +155,10 @@ const SESSION_PARENT_MAP = new Map<string, string>();
  * `linkForkLineageFromEventMetadata`), and both lineage resolution
  * (`getSessionParent`) and taint inheritance consult it fail-closed — a
  * fork of a tainted session is tainted.
+ *
+ * RESIDUAL GAP (not fixable in-process): silent host-level forks emit no
+ * promise-plugin hook event, so forks surfacing no source id link nothing.
+ * Hosts MUST call `recordSessionForkLink(child, parent)` at fork time.
  */
 const SESSION_FORK_MAP = new Map<string, string>();
 
@@ -197,12 +201,10 @@ const FORK_SOURCE_METADATA_KEYS = [
 
 /**
  * OH-6.6-taint-fork-gap: resolve fork lineage via session metadata on live
- * tool events. When a forked child session carries its source session id
- * under a known metadata key (top-level, `input`, or `metadata`), record
- * the fork link so subsequent `evaluateTaintGuard` calls inherit taint.
- * Returns the linked parent session id, or `undefined` when nothing
- * linkable is present. Never throws (fail-closed: unparseable events link
- * nothing).
+ * tool events. When a forked child carries its source id under a known key
+ * (top-level, `input`, `metadata`, or `headers`), record the fork link so
+ * `evaluateTaintGuard` inherits taint. Never throws; junk/self/empty link
+ * nothing; a forged clean-parent link allows exactly like no link.
  */
 export function linkForkLineageFromEventMetadata(
   sessionId: string,
@@ -214,7 +216,7 @@ export function linkForkLineageFromEventMetadata(
     }
     const record = event as Record<string, unknown>;
     const holders: Array<Record<string, unknown>> = [record];
-    for (const holderKey of ["input", "metadata"] as const) {
+    for (const holderKey of ["input", "metadata", "headers"] as const) {
       const holder = record[holderKey];
       if (holder !== null && typeof holder === "object") {
         holders.push(holder as Record<string, unknown>);
@@ -278,6 +280,11 @@ export function getSessionParent(sessionId: string): string | undefined {
  * Rewrites `x-session-affinity`, `X-Session-Id`, and `x-opencode-session` headers
  * in `session.hook("model.request")` so depth >= 2 subagents and forked child
  * sessions inherit the true root session ID without patching `affinity.ts`.
+ *
+ * OH-6.6-taint-fork-gap: also consult fork-metadata keys here (never
+ * throws) so `model.request` links the fork even before any tool event
+ * fires for the child. Silent forks stay invisible — hosts MUST call
+ * `recordSessionForkLink(child, parent)` at fork time.
  */
 export function applyRootAffinityHeadersInPlace(event: {
   sessionID?: string;
@@ -296,6 +303,10 @@ export function applyRootAffinityHeadersInPlace(event: {
   if (headerParent) {
     recordSessionParentLink(event.sessionID, headerParent);
   }
+
+  // OH-6.6-taint-fork-gap: link fork lineage here too, so a forked child
+  // inherits taint even before its first tool event fires (never throws).
+  linkForkLineageFromEventMetadata(event.sessionID, event);
 
   const rootAffinity = resolveRootSessionAffinity(event.sessionID);
   event.headers["x-session-affinity"] = rootAffinity;

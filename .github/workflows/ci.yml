@@ -21,7 +21,7 @@ jobs:
       - run: make accept
       - run: bun run build
       - run: bash scripts/check-loc.sh
-      - run: bash scripts/check-loc.sh --fail-over=12000 --fail-over-stripped=10000
+      - run: bash scripts/check-loc.sh --fail-over=12100 --fail-over-stripped=10100
 
   opencode-host:
     # Loads the plugin into the real OpenCode V2 plugin host (pinned upstream commit).

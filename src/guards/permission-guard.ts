@@ -484,9 +484,12 @@ function isPathWithinRoot(absTarget: string, absRoot: string): boolean {
  * OH-6.5-redirect-escape / OH-6.5-cp-mv-argv-targets: `true` when a shell
  * named-file target escapes the workspace root (absolute outside the root
  * and outside the OS temp dir, `..` traversal resolving outside, NUL bytes,
- * drive-letter paths, `~` home expansion). Relative targets resolve under
- * the workspace root. `fd`-redirect markers (`-`, `/dev/null`) are not file
- * targets and never escape. Fail-closed: anything unresolvable escapes.
+ * drive-letter paths, `~` home expansion, `$VAR`/`${VAR}`/`$(…)`/backtick
+ * targets which the shell would expand outside the root). Relative targets
+ * resolve under the workspace root. `fd`-redirect markers (`-`, `/dev/null`)
+ * are not file targets and never escape. Fail-closed: anything unresolvable
+ * escapes. Single-quoted literals containing `$`/backtick are over-blocked
+ * (safe direction; quote info is lost upstream of this predicate).
  */
 export function shellTargetEscapesWorkspace(target: string, workspaceRoot: string): boolean {
   if (typeof target !== "string") {
@@ -499,6 +502,14 @@ export function shellTargetEscapesWorkspace(target: string, workspaceRoot: strin
   if (trimmed === "-" || trimmed === "/dev/null") {
     return false;
   }
+  // OH-6.5-env-var-target-escape: any `$` (env-var / `${…}` / `$(…)`) or
+  // backtick (legacy command substitution) escapes fail-closed. Quote info
+  // is already lost before this predicate (`shellRedirectTargets` captures
+  // the inner group without quotes; `tokenizeTeeSegment` strips quotes), so
+  // a single-quoted literal such as `'$HOME/x'` is indistinguishable from
+  // an expandable target and is over-blocked — the safe direction.
+  if (trimmed.includes("$") || trimmed.includes("`"))
+    return true;
   if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
     return true;
   }

