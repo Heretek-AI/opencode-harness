@@ -1,0 +1,169 @@
+# QA red-proofs.log — stage audit-remediation-E
+# Worktree: /home/john/Projects/Heretek-AI-Rebuild/opencode-harness/worktrees/audit-remediation-E
+# Branch: audit-remediation-E, HEAD 88bdfe0 (programmer commit on baseline 9715874)
+# All test runs use TMPDIR=/dev/shm (/tmp inode-exhausted per audit). Recorded variant noted per command.
+# Role: agency-qa. No commits made. All src/ edits below are transient sabotage, each restored via `git checkout --`.
+
+## 0. Baseline identity
+$ git rev-parse HEAD
+88bdfe0e8b860624a88ca9868b05519355aea691
+$ git status --short   # before QA outputs existed
+(clean — no output)
+
+## 1. make-check equivalent (bun run check + bun test)
+$ TMPDIR=/dev/shm bun run check
+$ tsc --noEmit
+EXIT: 0
+$ TMPDIR=/dev/shm bun test
+  391 pass / 2 fail / 2132 expect() calls — 393 tests across 16 files
+  The 2 failures are the KNOWN TMPDIR-override artifacts, identical to baseline/D, unrelated to this diff:
+    (fail) OH-6.5-redirect-escape ... workspace-relative and OS-temp targets still allow for builder
+    (fail) OH-6.5-cp-mv-argv-targets ... legitimate absolute-source uses with workspace-relative dest allow
+  (Under TMPDIR=/dev/shm, os.tmpdir() is /dev/shm so the `tmpdir()` allowlist leg denies; product-correct
+  under normal tmpdir. Wave-1 accept, which does not depend on these legs, is ALL GREEN — see §2.)
+
+## 1a. Targeted suites
+$ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts
+  90 pass / 2 fail (same 2 known artifacts) / 583 expects — 92 tests
+$ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "OH-4.8"
+  5 pass / 0 fail
+$ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "taint-fork-gap"
+  12 pass / 0 fail (10 D-pinned + 2 E after-mirror)
+$ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "squat"
+  4 pass / 0 fail
+$ TMPDIR=/dev/shm bun test test/bootstrap.test.ts
+  1 pass / 0 fail
+
+## 2. Acceptance scripts
+$ TMPDIR=/dev/shm bash scripts/accept/wave-1.sh
+  ... every gate ok ...
+  WAVE 1 ACCEPT: ALL GATES GREEN
+  EXIT: 0
+$ TMPDIR=/dev/shm bash scripts/accept/wave-2.sh
+  WAVE 2 ACCEPT: GATES FAILED — EXIT: 1
+  Sole cause: the full-suite step reports the same 2 known TMPDIR artifacts above
+  (baseline audit itself was 380/2, so this step cannot pass under TMPDIR override at baseline either).
+  Every other gate inside wave-2 (typecheck, stub/scope/export/invariant coverage incl. event.system,
+  role-user, localeCompare pins) passes — PRE-EXISTING artifact, not a regression.
+$ TMPDIR=/dev/shm bash scripts/accept/wave-3.sh
+  WAVE 3 ACCEPT: GATES FAILED — EXIT: 1 (same sole cause: the 2 known TMPDIR artifacts in the
+  full-suite step; all plugin wiring/export/mcp-exact/scope gates pass)
+
+## 3. LOC + build
+$ bash scripts/check-loc.sh
+  loc-budget: files=22 raw=12089 (budget 12100) stripped=10024 (budget 10100) / tracked (exit 0)
+  EXIT: 0
+$ bash scripts/check-loc.sh --fail-over=12100 --fail-over-stripped=10100
+  raw 12089 within 12100; stripped 10024 within 10100; tracked (exit 0)
+  EXIT: 0
+$ bun run build   # tsc -p tsconfig.build.json
+  EXIT: 0
+
+## 4. Live audit-proof re-runs (TMPDIR=/dev/shm, via wireOpenCodeV2PromiseContext — the E wiring)
+### 4a. OH-4.8 full proof (modify code.ts + notes.txt + create brand-new.txt during subagent window)
+$ TMPDIR=/dev/shm bun docs/evidence/audit-remediation-E/tmp-qa-proof-48.ts   # temp script, deleted after §7
+  === FULL ===
+  done
+  <mutation-receipt session="qa-full-child" changedFiles="3">
+    <file path="brand-new.txt" before="none" after="7aa7a5359173d05b" />
+    <file path="code.ts" before="037ecd1db38c230c" after="e7941bea8a318009" />
+    <file path="notes.txt" before="5891b5b522d5df08" after="e258d248fda94c63" />
+  </mutation-receipt>
+  PROOF48_EXIT: 0
+  All three files receipted. code.ts/brand-new.txt SHAs byte-identical to the audit raw output
+  (037ecd1db38c230c, 7aa7a5359173d05b). notes.txt before/after SHAs present and differ.
+### 4b. Isolated-modify-only variant
+  === ISO ===
+  <mutation-receipt session="qa-iso-child" changedFiles="1">
+    <file path="notes.txt" before="5891b5b522d5df08" after="e258d248fda94c63" />
+  </mutation-receipt>
+  changedFiles="1" (was "0" at baseline) — PASS
+### 4c. Modify + delete variant
+  === DEL ===
+  <mutation-receipt session="qa-del-child" changedFiles="2">
+    <file path="config.json" before="ca3d163bab055381" after="bb157861a164e35c" />
+    <file path="notes.txt" before="5891b5b522d5df08" after="deleted" />
+  </mutation-receipt>
+  Deletion listed as after="deleted" — PASS
+### 4d. Fork (taint-fork-gap)
+$ TMPDIR=/dev/shm bun docs/evidence/audit-remediation-E/tmp-qa-proof-fork-squat.ts   # temp script, deleted after §7
+  fork-source(child)= qa-fork-parent-...   (after-mirror linked lineage)
+  tainted-child ssh => deny TAINT-NET-2    (tainted parent -> forked child ssh DENIES)
+  fork-source(cleanChild)= qa-clean-parent-...
+  clean-child ssh => allow                 (clean fork allows — no over-taint)
+  silent-child fork-source= undefined
+  silent-child ssh => allow                (documented residual/upstream limitation — pinned, NOT filed as regression)
+  PROOFFS_EXIT: 0
+### 4e. Squat (taint-name-squat)
+  "file_hash_read" => taint=false / "read" => taint=false / "shell" => taint=false (built-in safe names stay false)
+  ingestion webfetch arms: true (discovery ids still arm)
+  marked squat arms: true  ({tool file_hash_read + metadata.mcpServer} -> isMcpProvenanceEvent true)
+  bare squat taint: false (documented residual: exact-name match with no marker — pinned, NOT a regression)
+
+## 5. RED-PROOF SABOTAGE (each: sabotage -> RED non-zero -> git checkout -- restore -> GREEN)
+### SAB-1 (OH-4.8): revert before-snapshot to ranked/code-only set
+  Edit src/host/contract-adapter.ts:
+    - preSubagentDigestsBySession.set(sessionId, captureWorkspaceDigests(allRel, workspaceRoot));
+    + preSubagentDigestsBySession.set(sessionId, captureWorkspaceDigests(allRel.filter((p) => p.endsWith(".ts")), workspaceRoot));
+  $ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "unranked-modification"
+    2 pass / 3 fail (full proof, isolated, delete variants RED; 2 degraded-path tests stay green, as designed)
+    Bun EXIT: 1  <-- RED confirmed
+  $ git checkout -- src/host/contract-adapter.ts && git status --short
+    (clean: only untracked docs/evidence/audit-remediation-E/)
+  $ TMPDIR=/dev/shm bun test ... -t "unranked-modification"
+    5 pass / 0 fail  <-- GREEN re-confirmed
+### SAB-2 (fork-gap): neuter fork linkage
+  Edit src/interceptors/session-interceptors.ts line 176:
+    - SESSION_FORK_MAP.set(childSessionID, parentSessionID);
+    + SESSION_FORK_MAP.set(childSessionID, childSessionID);
+  $ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "taint-fork-gap"
+    3 pass / 9 fail — Bun EXIT: 1  <-- RED confirmed
+  $ git checkout -- src/interceptors/session-interceptors.ts && git status --short  # clean
+  Re-run: 12 pass / 0 fail  <-- GREEN re-confirmed
+### SAB-3 (squat): neuter provenance check
+  NOTE: first attempt (removing the `|| isMcpProvenanceEvent(event)` disjunct at contract-adapter.ts:728
+  only) left `-t squat`/`-t provenance` at 4/4 green — no adapter-level test asserts marked-squat ingestion
+  deny through the wire path, so that sabotage is NOT a valid red-proof of the squat tests (recorded honestly;
+  file restored via `git checkout -- src/host/contract-adapter.ts`, clean).
+  Valid sabotage — neutering isMcpProvenanceEvent in src/guards/taint-guard.ts to `void event; return false;`
+  (clean full-function replacement, semantic not syntactic):
+  $ TMPDIR=/dev/shm bun test test/audit-20261018-remediation.test.ts -t "squat"
+    2 pass / 2 fail (marker-matrix + squat-composition RED; bare-matrix + never-throws stay green, correct)
+    Bun EXIT: 1  <-- RED confirmed
+  $ git checkout -- src/guards/taint-guard.ts && git status --short  # clean
+  Re-run: 4 pass / 0 fail  <-- GREEN re-confirmed
+### SAB-4 (release-identity): version skew
+  Edit src/version.ts: HARNESS_RELEASE_VERSION "1.0.11" -> "9.9.9-sabotage"
+  $ TMPDIR=/dev/shm bun test test/bootstrap.test.ts
+    0 pass / 1 fail — Bun EXIT: 1  <-- RED confirmed
+  $ git checkout -- src/version.ts && git status --short  # clean
+  Re-run: 1 pass / 0 fail  <-- GREEN re-confirmed
+
+## 6. Release-identity (prepare-only) verification
+$ sed -n '3p' package.json  -> "version": "1.0.11"
+$ sed -n '5p' src/version.ts -> export const HARNESS_RELEASE_VERSION = "1.0.11";  (identity held, bootstrap green)
+$ git tag --list 'v*' | tail  -> max v1.0.9 (no v1.0.10/v1.0.11/v1.0.12 tags created by programmer)
+$ git rev-parse v1.0.12 -> fatal: ambiguous argument (no bump/tag/publish performed — correct)
+$ git log --oneline v1.0.9..HEAD | wc -l -> 15 (14 baseline + 1 E programmer commit)
+  HUMAN-ONLY checklist present in docs/reports/audit-remediation-E.md (§HUMAN-ONLY release checklist, NOT executed).
+
+## 7. Stub / scope scans
+$ grep -rn -E 'TODO|test\.skip|...|cmd: "true"|echo "passed"' src/ test/ scripts/
+  Hits ONLY inside scripts/accept/*.sh quoting the patterns as scanner documentation (the scanners
+  themselves) + one test/wave8-audit.test.ts `node -e "process.exit(0)"` fixture string — zero production stubs.
+$ grep -rn -E '\|\| true|set \+e' src/ test/ scripts/ -> only the wave-8 scanner's own pattern string.
+$ empty `catch {}` scan -> zero hits. `return true` hits are conditional logic returns in guard
+  classifiers (e.g. shell-parse flag checks), not vacuous passes.
+$ scope scan (listen\(|createServer|express\(|fleet|daemon|worktree-manager|epistemic) ->
+  only mcp-defaults.ts doc comment ("...are out") + accept-script scanner patterns. No forbidden surfaces.
+  Temp proof scripts (tmp-qa-proof-48.ts, tmp-qa-proof-fork-squat.ts) DELETED after use:
+$ rm docs/evidence/audit-remediation-E/tmp-qa-proof-48.ts docs/evidence/audit-remediation-E/tmp-qa-proof-fork-squat.ts
+
+## 8. Final state
+$ TMPDIR=/dev/shm bun test  -> 391 pass / 2 fail (same 2 known artifacts)
+$ TMPDIR=/dev/shm bun run check -> EXIT 0
+$ TMPDIR=/dev/shm bash scripts/accept/wave-1.sh -> WAVE 1 ACCEPT: ALL GATES GREEN
+$ git status --short -> shows ONLY:
+  ?? docs/evidence/audit-remediation-E/   (this log)
+  ?? docs/reports/audit-remediation-E-qa.md (QA report)
+  No modified-file residue. No commits made.
