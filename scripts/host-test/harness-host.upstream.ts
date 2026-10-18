@@ -3,16 +3,25 @@
  * `anomalyco/opencode` checkout by `scripts/host-test/run.sh` and run with the
  * upstream `PluginTestLayer` fixture, so the harness is loaded through the
  * real promise-plugin adapter and tool registry (not a mock).
+ *
+ * Covers every direct tool (including failure-path executions that prove the
+ * OH-3.2 host-level failure signaling), Code Mode companions, hook
+ * registration/firing, options, calibration determinism, compaction,
+ * affinity, and scope-close unload plus reload — adapted from the audit's
+ * Alpha extended/session/unload suites to repo paths (no fixture dir needed;
+ * read-only tools run against `HARNESS_ROOT`, mutating tools run failure-path
+ * or in-memory only so the checkout is never modified).
  */
 import { expect } from "bun:test"
 import { Agent } from "@opencode/core/agent"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHost } from "@opencode/core/plugin/host"
 import { PluginPromise } from "@opencode/core/plugin/promise"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Tool } from "@opencode/core/tool"
 import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
-import { Effect, Exit } from "effect"
+import { Effect, Exit, Scope } from "effect"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
 
@@ -37,30 +46,308 @@ const EXPECTED_TOOLS = [
   "verify_scoped",
 ]
 
+// companions registered as tools.harness.* (effective names harness_<name>)
+const EXPECTED_CODEMODE = [
+  "file_hash_read",
+  "ast_structural_search",
+  "repo_map",
+  "blast_radius",
+  "file_outline",
+  "symbol_references",
+  "rename_symbol",
+  "architecture_audit",
+]
+
 const it = testEffect(PluginTestLayer)
+
+const call = (
+  snapshot: { execute: (input: any) => Effect.Effect<any, any> },
+  name: string,
+  input: Record<string, unknown>,
+) =>
+  snapshot
+    .execute({
+      sessionID: Session.ID.make("ses_harness_host"),
+      agent: Agent.ID.make("build"),
+      messageID: SessionMessage.ID.make("msg_harness_host"),
+      call: { type: "tool-call", id: `call_${name}_${Math.random().toString(36).slice(2, 8)}`, name, input },
+    })
+    .pipe(Effect.exit)
+
+const textOf = (result: Exit.Exit<unknown, unknown>): string => JSON.stringify(Exit.isSuccess(result) ? result.value : result)
 
 it.live("opencode-harness registers every tool in the real OpenCode V2 host and unloads cleanly", () =>
   Effect.gen(function* () {
     const plugins = yield* Plugin.Service
     const tools = yield* Tool.Service
+    const hooks = yield* PluginHooks.Service
     yield* PluginPromise.fromPromise({
       id: harness.id,
-      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT }),
+      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT, taskMd: "# Host task\nLive wires." }),
     }).effect(yield* PluginHost.make(plugins))
 
     const snapshot = yield* tools.snapshot()
     const names = snapshot.definitions.map((d: { name?: string; id?: string }) => d.name ?? d.id)
     for (const name of EXPECTED_TOOLS) expect(names).toContain(name)
 
-    const result = yield* snapshot
-      .execute({
-        sessionID: Session.ID.make("ses_harness_host"),
-        agent: Agent.ID.make("build"),
-        messageID: SessionMessage.ID.make("msg_harness_host"),
-        call: { type: "tool-call", id: "call_harness_host", name: "file_hash_read", input: { path: "package.json", limit: 2 } },
-      })
-      .pipe(Effect.exit)
-    expect(Exit.isSuccess(result)).toBe(true)
-    expect(JSON.stringify(Exit.isSuccess(result) ? result.value : null)).toContain("@heretek-ai/opencode-harness")
+    // ---- Code Mode companions: effective names + catalog + live execute ----
+    const listed = yield* tools.list()
+    for (const name of EXPECTED_CODEMODE) {
+      const match = (listed as Array<{ name: string; options?: { namespace?: string; codemode?: boolean; pinned?: boolean } }>).find(
+        (t) => t.name === name && t.options?.namespace === "harness" && t.options?.codemode === true && t.options?.pinned === true,
+      )
+      expect(match).not.toBeUndefined()
+    }
+    const catalogText = JSON.stringify((snapshot as unknown as { codeModeCatalog?: unknown }).codeModeCatalog ?? {})
+    expect(catalogText).toContain("harness")
+
+    // ---- direct tool executions (read-only tools succeed on the checkout) ----
+    let r = yield* call(snapshot, "file_hash_read", { path: "package.json", limit: 2 })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("@heretek-ai/opencode-harness")
+
+    r = yield* call(snapshot, "ast_structural_search", {
+      code: "const a = 1;\nconsole.log(a);\n",
+      pattern: "console.log($VAR)",
+      language: "typescript",
+    })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("console.log")
+
+    r = yield* call(snapshot, "ui_geometry_audit", {
+      elements: [{ tag: "button", rect: { x: 0, y: 0, width: 10, height: 10 }, interactive: true }],
+    })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("tiny-interactive-target")
+
+    r = yield* call(snapshot, "repo_map", { topK: 5 })
+    expect(Exit.isSuccess(r)).toBe(true)
+
+    r = yield* call(snapshot, "blast_radius", { path: "src/index.ts" })
+    expect(Exit.isSuccess(r)).toBe(true)
+
+    r = yield* call(snapshot, "file_outline", { path: "src/index.ts" })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("symbols")
+
+    r = yield* call(snapshot, "symbol_references", { symbol: "computeLineHash", maxResults: 5 })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("computeLineHash")
+
+    r = yield* call(snapshot, "architecture_audit", { files: ["package.json"] })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("architecture-audit")
+
+    r = yield* call(snapshot, "verify_scoped", { modifiedFiles: ["package.json"], timeoutMs: 60000 })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("verification-report")
+
+    // ---- mutating tools: in-memory/no-op paths, never touching the checkout ----
+    r = yield* call(snapshot, "checkpoint_create", { label: "host", files: ["package.json"] })
+    expect(Exit.isSuccess(r)).toBe(true)
+    r = yield* call(snapshot, "checkpoint_rollback", {})
+    expect(Exit.isSuccess(r)).toBe(true)
+
+    r = yield* call(snapshot, "rename_symbol", { oldSymbol: "harnessNoSuchSymbolZZZ9", newSymbol: "x" })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("noop")
+
+    // ---- OH-3.2 failure signaling through the real host pipeline ----
+    // (re-read first: checkpoint_rollback above rewrote package.json, so the
+    // stale-read detector requires a fresh read before any mutation attempt)
+    r = yield* call(snapshot, "file_hash_read", { path: "package.json", limit: 1 })
+    expect(Exit.isSuccess(r)).toBe(true)
+    r = yield* call(snapshot, "file_hash_edit", {
+      path: "package.json",
+      hunks: [{ startLine: 1, startHash: "0000", endLine: 1, endHash: "ffff", replacement: "x" }],
+    })
+    expect(Exit.isFailure(r)).toBe(true)
+    expect(textOf(r)).toContain("anchor mismatch")
+
+    // (re-read again: the failed edit above opened + rolled back a
+    // transaction, bumping mtime — the stale-read detector requires freshness)
+    r = yield* call(snapshot, "file_hash_read", { path: "package.json", limit: 1 })
+    expect(Exit.isSuccess(r)).toBe(true)
+    r = yield* call(snapshot, "ast_structural_rewrite", {
+      path: "package.json",
+      pattern: "console.log($MSG)",
+      rewrite: "logger.info($MSG)",
+    })
+    expect(Exit.isFailure(r)).toBe(true)
+    expect(textOf(r)).toContain("no structural match")
+
+    // ---- codemode companion executes through the real "execute" tool ----
+    r = yield* call(snapshot, "execute", {
+      code: 'return await tools.harness["file_hash_read"]({path:"package.json",limit:5});',
+    })
+    expect(Exit.isSuccess(r)).toBe(true)
+    expect(textOf(r)).toContain("@heretek-ai/opencode-harness")
+
+    // ---- hook registration in the real host ----
+    expect(yield* hooks.has("tool", "execute.before")).toBe(true)
+    expect(yield* hooks.has("tool", "execute.after")).toBe(true)
+    expect(yield* hooks.has("permission", "evaluate")).toBe(true)
+    expect(yield* hooks.has("shell", "create.before")).toBe(true)
+    expect(yield* hooks.has("session", "context")).toBe(true)
+    expect(yield* hooks.has("session", "compaction")).toBe(true)
+    expect(yield* hooks.has("session", "generate")).toBe(true)
+    expect(yield* hooks.has("session", "model.request")).toBe(true)
+    expect(yield* hooks.has("session", "retry")).toBe(true)
+    expect(yield* hooks.has("session", "prompt")).toBe(true)
+
+    // ---- permission hook fires through the real pipeline ----
+    const permEvent = {
+      sessionID: Session.ID.make("ses_perm"),
+      agent: Agent.ID.make("agency-qa"),
+      action: "edit",
+      resources: ["src/index.ts"],
+      effect: "allow" as const,
+    }
+    yield* hooks.trigger("permission", "evaluate", permEvent as never)
+    expect(permEvent.effect).toBe("deny")
+
+    // ---- shell hook fires through the real pipeline ----
+    const shellEvent = { command: "echo host-shell-probe", cwd: HARNESS_ROOT, timeout: 30000, shell: "bash", env: {} as Record<string, string | undefined> }
+    yield* hooks.trigger("shell", "create.before", shellEvent as never)
+    expect(shellEvent.env["CI"]).toBe("1")
+    expect(shellEvent.env["PAGER"]).toBe("cat")
+
+    // ---- session context hook: system untouched by default, budget on user msg ----
+    const ctxEvent = {
+      sessionID: Session.ID.make("ses_ctx"),
+      agent: Agent.ID.make("build"),
+      model: { providerID: "test", id: "test-model" },
+      system: [{ type: "text", text: "You are OpenCode, a coding agent." }],
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      options: {},
+      tools: {},
+    }
+    const sysBefore = (ctxEvent.system[0] as { text: string }).text
+    yield* hooks.trigger("session", "context", ctxEvent as never)
+    expect((ctxEvent.system[0] as { text: string }).text).toBe(sysBefore)
+    const userText = ((ctxEvent.messages[0] as { content: Array<{ text: string }> }).content[0] as { text: string }).text
+    expect(userText).toContain("Host task")
+
+    // ---- retry hook fires through the real pipeline ----
+    const retryEvent = {
+      sessionID: Session.ID.make("ses_retry"),
+      agent: Agent.ID.make("build"),
+      model: { providerID: "test", id: "test-model" },
+      error: { type: "incomplete-stream", message: "stream cut" },
+      attempt: 1,
+      decision: { retry: false as const },
+    }
+    yield* hooks.trigger("session", "retry", retryEvent as never)
+    expect((retryEvent.decision as { retry: boolean }).retry).toBe(true)
+  }),
+)
+
+const OVER = "You are OpenCode, a coding agent.\n- Use the `subagent` tool to minimize context token usage whenever tool calls generate large outputs but only a small subset is useful for the task at hand. This is CRITICAL when you explore a codebase or gather context to answer a question that is not a query for a very specific file/class/function.\n"
+
+it.live("opencode-harness calibration is deterministic; prompt hook sanitizes; compaction and affinity hold", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const hooks = yield* PluginHooks.Service
+    yield* PluginPromise.fromPromise({
+      id: harness.id,
+      setup: (ctx: unknown) =>
+        harness.setup(ctx, { rootDir: HARNESS_ROOT, museCalibration: true, taskMd: "# T" }),
+    }).effect(yield* PluginHost.make(plugins))
+
+    const mkCtx = () => ({
+      sessionID: Session.ID.make("ses_cal"),
+      agent: Agent.ID.make("build"),
+      model: { providerID: "test", id: "test-model" },
+      system: [{ type: "text", text: OVER }],
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      options: {},
+      tools: {},
+    })
+    const e1 = mkCtx()
+    yield* hooks.trigger("session", "context", e1 as never)
+    const sys1 = (e1.system[0] as { text: string }).text
+    expect(sys1).toContain("<muse-1.3-harness-calibration>")
+    expect(sys1).not.toContain("minimize context token usage whenever")
+    // second turn, identical input -> identical system (KV-cache safe)
+    const e2 = mkCtx()
+    yield* hooks.trigger("session", "context", e2 as never)
+    expect((e2.system[0] as { text: string }).text).toBe(sys1)
+
+    // prompt hook: upstream SessionPrompt carries prompt text, not system —
+    // the harness sanitizes the text instead of no-op'ing (OH-2.4).
+    const promptEvent = {
+      sessionID: Session.ID.make("ses_p"),
+      messageID: SessionMessage.ID.make("msg_p"),
+      prompt: "<recent-context>\n[Assistant tool call]: read({\"path\": \"x\"})\n</recent-context>",
+    }
+    yield* hooks.trigger("session", "prompt", promptEvent as never)
+    expect((promptEvent as Record<string, unknown>).system).toBeUndefined()
+    expect((promptEvent as Record<string, unknown>).prompt as string).toContain(
+      "historical-summary-only-use-native-tool-calls",
+    )
+
+    // compaction decontamination through the real pipeline
+    const compEvent = {
+      sessionID: Session.ID.make("ses_c"),
+      agent: Agent.ID.make("build"),
+      model: { providerID: "test", id: "test-model" },
+      system: [
+        { type: "text", text: "Project instructions: follow the repo style guide." },
+        { type: "text", text: "# Your Model\nsome model card" },
+      ],
+      messages: [],
+      options: {},
+      tools: { staleTool: { description: "x", input: {} } },
+    }
+    yield* hooks.trigger("session", "compaction", compEvent as never)
+    const sysTexts = (compEvent.system as Array<{ text: string }>).map((p) => p.text)
+    expect(sysTexts.some((t) => t.includes("repo style guide"))).toBe(true)
+    expect(sysTexts.some((t) => t.startsWith("# Your Model"))).toBe(false)
+    expect(Object.keys(compEvent.tools as object).length).toBe(0)
+
+    // root affinity headers through the real pipeline
+    const modelEvent = {
+      sessionID: Session.ID.make("ses_m"),
+      agent: Agent.ID.make("build"),
+      model: { providerID: "test", id: "test-model" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    }
+    yield* hooks.trigger("session", "model.request", modelEvent as never)
+    expect(typeof (modelEvent.headers as Record<string, string>)["x-session-affinity"]).toBe("string")
+  }),
+)
+
+it.live("opencode-harness unload removes tools and hooks, reload restores exactly once", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const tools = yield* Tool.Service
+    const hooks = yield* PluginHooks.Service
+    const countHarness = (defs: Array<{ name?: string; id?: string }>) =>
+      defs.filter((d) => EXPECTED_TOOLS.includes((d.name ?? d.id) as string)).length
+    const scope = yield* Scope.make()
+    yield* PluginPromise.fromPromise({
+      id: harness.id,
+      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT }),
+    })
+      .effect(yield* PluginHost.make(plugins))
+      .pipe(Effect.provideService(Scope.Scope, scope))
+    expect(countHarness((yield* tools.snapshot()).definitions)).toBe(14)
+    expect(yield* hooks.has("tool", "execute.before")).toBe(true)
+    yield* Scope.close(scope, Exit.void)
+    expect(countHarness((yield* tools.snapshot()).definitions)).toBe(0)
+    expect(yield* hooks.has("tool", "execute.before")).toBe(false)
+    expect(yield* hooks.has("session", "context")).toBe(false)
+    // reload in a fresh scope restores everything exactly once
+    const scope2 = yield* Scope.make()
+    yield* PluginPromise.fromPromise({
+      id: harness.id,
+      setup: (ctx: unknown) => harness.setup(ctx, { rootDir: HARNESS_ROOT }),
+    })
+      .effect(yield* PluginHost.make(plugins))
+      .pipe(Effect.provideService(Scope.Scope, scope2))
+    expect(countHarness((yield* tools.snapshot()).definitions)).toBe(14)
+    yield* Scope.close(scope2, Exit.void)
+    expect(countHarness((yield* tools.snapshot()).definitions)).toBe(0)
   }),
 )

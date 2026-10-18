@@ -15,11 +15,17 @@
  *   `agency-coordinator`, `agency-drift-guard` denied `edit`/`write`/`patch`
  *   and file-mutating shell.
  * - Rule 3 (QA Red-Team Source Lock): `qa-adversary`, `agency-qa` denied
- *   `edit`/`write`/`patch` on `src/**` and permitted only on test, spec,
- *   accept-script, and docs paths.
+ *   `edit`/`write`/`patch` on `src/**` (`rule-3a-qa-src-lock`) and permitted
+ *   only on test, spec, accept-script, and docs paths (`rule-3b-qa-allowlist`
+ *   otherwise); every file-mutating shell command is denied for QA roles
+ *   (`rule-3-qa-source-lock`, OH-6.3-qa-shell-bypass).
  * - Rule 4 (Architect Contract Lock): `lockedContractGlobs` (defaulting to
  *   the contracts and schema globs from SPEC Section 2.3 C) modifiable only
- *   by `architect`.
+ *   by `architect` — enforced for edit paths and for shell redirect/tee
+ *   targets (OH-6.4-contract-shell-bypass).
+ * - Rule 5 (Task-Owned Paths): per-role `taskOwnedPaths` confinement,
+ *   enforced for edit paths and for shell redirect/tee targets
+ *   (OH-6.4-task-owned-shell-bypass).
  */
 
 import {
@@ -79,6 +85,9 @@ const KNOWN_STANDARD_ROLES = new Set([
   "build",
   "explore",
   "plan",
+  // Router staff roles (OH-8.3-staff-roles): documented builder-policy roles.
+  "staff-backend",
+  "staff-ui",
 ]);
 
 const QA_WRITABLE_GLOBS = [
@@ -263,6 +272,165 @@ export function matchesAnyGlob(path: string, globs: string[]): boolean {
   return globs.some((glob) => globToRegExp(glob).test(normalized));
 }
 
+/**
+ * Extract `>` / `>>` redirect target paths from a shell command string.
+ * Handles unquoted, double-quoted, and single-quoted targets; fd-prefixed
+ * redirects (`2> /dev/null`) are never treated as file targets and
+ * `/dev/null` is skipped (OH-6.4-contract-shell-bypass).
+ */
+export function shellRedirectTargets(command: string): string[] {
+  if (typeof command !== "string" || command.length === 0) {
+    return [];
+  }
+  const targets: string[] = [];
+  const re = /(^|[^\d])>{1,2}\s*("([^"]+)"|'([^']+)'|([^\s;|&<>]+))/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    const target = (m[3] ?? m[4] ?? m[5] ?? "") as string;
+    if (target.length > 0 && target !== "/dev/null") {
+      targets.push(target);
+    }
+  }
+  return targets;
+}
+
+/** Split a command into `|`/`;`/`&`/newline segments, quote-aware. */
+function splitTeeSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string;
+    if (quote !== null) {
+      if (ch === quote) {
+        quote = null;
+      }
+      current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === "|" || ch === ";" || ch === "&" || ch === "\n") {
+      if (current.trim().length > 0) {
+        segments.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim().length > 0) {
+    segments.push(current.trim());
+  }
+  return segments;
+}
+
+/** Tokenize one pipeline segment, stripping quotes but keeping quoted spans whole. */
+function tokenizeTeeSegment(segment: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i] as string;
+    if (quote !== null) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    if (ch === "<" || ch === ">" || ch === "(" || ch === ")") {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+  return tokens;
+}
+
+/**
+ * Extract `tee` (and `sudo tee`) target paths from a shell command string.
+ * Option flags (`-a`, `--append`, `-i`, …) are skipped; `--` terminates
+ * option parsing. Bare `-` (stdout marker) is not a file target.
+ * (OH-6.4-contract-shell-bypass: `tee` needs the same treatment as `>`.)
+ */
+export function shellTeeTargets(command: string): string[] {
+  if (typeof command !== "string" || command.length === 0) {
+    return [];
+  }
+  const targets: string[] = [];
+  for (const segment of splitTeeSegments(command)) {
+    const tokens = tokenizeTeeSegment(segment);
+    if (tokens.length === 0) {
+      continue;
+    }
+    let teeIndex = -1;
+    for (let i = 0; i < tokens.length; i++) {
+      const base = (tokens[i] as string).split("/").pop() ?? "";
+      if (base === "tee") {
+        teeIndex = i;
+        break;
+      }
+    }
+    if (teeIndex < 0) {
+      continue;
+    }
+    let endOfOptions = false;
+    for (let i = teeIndex + 1; i < tokens.length; i++) {
+      const token = tokens[i] as string;
+      if (!endOfOptions && token === "--") {
+        endOfOptions = true;
+        continue;
+      }
+      if (!endOfOptions && token.startsWith("-") && token !== "-") {
+        continue;
+      }
+      if (token === "-" || token.length === 0) {
+        continue;
+      }
+      targets.push(token);
+    }
+  }
+  return targets;
+}
+
+/**
+ * Union of `shellRedirectTargets` and `shellTeeTargets` (deduplicated,
+ * redirects first) — the named-file write surface of a shell command.
+ */
+export function shellNamedFileTargets(command: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const target of [...shellRedirectTargets(command), ...shellTeeTargets(command)]) {
+    if (!seen.has(target)) {
+      seen.add(target);
+      out.push(target);
+    }
+  }
+  return out;
+}
+
 function deny(reason: string, rule: string): GuardVerdict {
   return { allowed: false, reason, rule };
 }
@@ -277,7 +445,7 @@ export function normalizeRoleName(role: string): string {
 }
 
 /**
- * Evaluate a tool/permission request against Rules 0–4 plus optional
+ * Evaluate a tool/permission request against Rules 0–5 plus optional
  * per-role `taskOwnedPaths`. Unknown tool names are denied (fail-closed);
  * anything not denied by an explicit rule is allowed.
  */
@@ -369,12 +537,25 @@ export function evaluateBoardGuard(
     if (path === "src" || path.startsWith("src/")) {
       return deny(
         `guard: red-team role ${JSON.stringify(role)} may not modify src/**: ${JSON.stringify(path)}`,
-        "rule-3-qa-source-lock",
+        "rule-3a-qa-src-lock",
       );
     }
     if (!matchesAnyGlob(path, QA_WRITABLE_GLOBS)) {
       return deny(
         `guard: red-team role ${JSON.stringify(role)} may only modify test/spec/accept/docs paths: ${JSON.stringify(path)}`,
+        "rule-3b-qa-allowlist",
+      );
+    }
+  }
+
+  // OH-6.3-qa-shell-bypass: the QA red-team `src/**` lock covers edit tools
+  // only without this leg — any file-mutating shell (`rm src/…`, redirect,
+  // `sed -i`, `git checkout -- src/…`) would be allowed. Deny every
+  // non-read-only shell command for QA roles (fail-closed).
+  if (QA_RED_TEAM_ROLES.has(role) && isShellTool(tool)) {
+    if (classifyShellCommand(command).class !== "read-only") {
+      return deny(
+        `guard: red-team role ${JSON.stringify(role)} may not run file-mutating shell (fail-closed): ${JSON.stringify(command)}`,
         "rule-3-qa-source-lock",
       );
     }
@@ -403,6 +584,23 @@ export function evaluateBoardGuard(
     }
   }
 
+  // OH-6.4-contract-shell-bypass: locked contract globs are enforceable only
+  // via `path` without this leg — shell requests carry the target in
+  // `command` (`echo … > contracts/…`, `… | tee …`) and are never inspected.
+  // Enforce redirect/tee targets for non-architect roles (fail-closed).
+  if (isShellTool(tool) && role !== "architect") {
+    if (classifyShellCommand(command).class !== "read-only") {
+      for (const target of shellNamedFileTargets(command)) {
+        if (matchesAnyGlob(target, lockedGlobs)) {
+          return deny(
+            `guard: contract path ${JSON.stringify(target)} is locked to the architect role (fail-closed); ${JSON.stringify(role)} denied`,
+            "rule-4-contract-lock",
+          );
+        }
+      }
+    }
+  }
+
   const owned = policy.taskOwnedPaths?.[role];
   if (owned !== undefined && isEditTool(tool) && path !== undefined) {
     if (!matchesAnyGlob(path, owned)) {
@@ -410,6 +608,22 @@ export function evaluateBoardGuard(
         `guard: role ${JSON.stringify(role)} owns [${owned.join(", ")}]; ${JSON.stringify(path)} is outside its task paths`,
         "rule-5-task-owned-paths",
       );
+    }
+  }
+
+  // OH-6.4-task-owned-shell-bypass: `taskOwnedPaths` confinement is
+  // edit-only without this leg — shell redirect/tee targets outside the
+  // owned globs would be writable. Enforce shell targets the same way.
+  if (owned !== undefined && isShellTool(tool)) {
+    if (classifyShellCommand(command).class !== "read-only") {
+      for (const target of shellNamedFileTargets(command)) {
+        if (!matchesAnyGlob(target, owned)) {
+          return deny(
+            `guard: role ${JSON.stringify(role)} owns [${owned.join(", ")}]; shell target ${JSON.stringify(target)} is outside its task paths (fail-closed)`,
+            "rule-5-task-owned-paths",
+          );
+        }
+      }
     }
   }
 

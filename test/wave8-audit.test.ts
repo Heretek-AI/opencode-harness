@@ -198,7 +198,7 @@ describe("OH-6.1-role-normalization-default-allow", () => {
       path: "src/index.ts",
     });
     expect(verdict.allowed).toBe(false);
-    expect(verdict.rule).toBe("rule-3-qa-source-lock");
+    expect(verdict.rule).toBe("rule-3a-qa-src-lock");
   });
 
   test("unknown roles (root) fail closed to least privilege", () => {
@@ -297,10 +297,18 @@ describe("OH-6.6-taint-dead-for-mcp", () => {
     expect(isUntrustedIngestionTool("lsp-mcp-server_hover")).toBe(true);
     expect(isUntrustedIngestionTool("mcp_tool")).toBe(true);
     expect(isUntrustedIngestionTool("webfetch")).toBe(true);
+    // OH-6.6-single-word-mcp-server: single-word servers yield bare
+    // `<server>_<tool>` names with no hyphen — all arm taint fail-closed.
+    expect(isUntrustedIngestionTool("tavily_search")).toBe(true);
+    expect(isUntrustedIngestionTool("fetch_search")).toBe(true);
+    expect(isUntrustedIngestionTool("fallow_search")).toBe(true);
+    expect(isUntrustedIngestionTool("my_server_tool")).toBe(true);
     expect(isUntrustedIngestionTool("file_hash_read")).toBe(false);
     expect(isUntrustedIngestionTool("ast_structural_search")).toBe(false);
     expect(isUntrustedIngestionTool("rename_symbol")).toBe(false);
     expect(isUntrustedIngestionTool("edit")).toBe(false);
+    expect(isUntrustedIngestionTool("read")).toBe(false);
+    expect(isUntrustedIngestionTool("bash")).toBe(false);
   });
 
   test("tainted curl|sh is DENY", () => {

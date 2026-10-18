@@ -166,6 +166,25 @@ describe("Muse 1.3 system prompt calibration option", () => {
   test("rejects a non-boolean museCalibration", async () => {
     await expect(promptHandlers({ museCalibration: "yes" })).rejects.toThrow(/museCalibration/);
   });
+
+  test("prompt hook sanitizes upstream-shaped prompt text without system (OH-2.4)", async () => {
+    const handlers = await promptHandlers();
+    const upstreamShaped = {
+      agent: "builder",
+      prompt: "<recent-context>\n[Assistant tool call]: read({\"path\": \"x\"})\n</recent-context>",
+    };
+    await handlers.get("prompt")!(upstreamShaped as never);
+    expect((upstreamShaped as { prompt: string }).prompt).toContain(
+      "historical-summary-only-use-native-tool-calls",
+    );
+    // Compaction agents are skipped entirely.
+    const compactionShaped = {
+      agent: "compaction",
+      prompt: "<recent-context>\n[Assistant tool call]: read({\"path\": \"x\"})\n</recent-context>",
+    };
+    await handlers.get("prompt")!(compactionShaped as never);
+    expect((compactionShaped as { prompt: string }).prompt).toContain("[Assistant tool call]");
+  });
 });
 
 describe("hashEditFile partial anchor mismatch", () => {

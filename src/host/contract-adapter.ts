@@ -890,7 +890,31 @@ export function wireOpenCodeV2PromiseContext(params: {
   // 8. Wire `session.hook` (`prompt`, `context`, `generate`, `compaction`, `model.request`, `retry`)
   if (typeof ctx.session?.hook === "function") {
     ctx.session.hook("prompt", (event: OpenCodeV2SessionPromptEvent) => {
-      if (!museCalibration || isCompactionAgent(event.agent)) {
+      if (isCompactionAgent(event.agent)) {
+        return;
+      }
+      // Upstream `SessionPrompt` carries prompt text (`prompt`/`metadata`/
+      // `delivery`), never `system` — sanitize the prompt text so this hook
+      // acts on the real host shape instead of permanent no-op (OH-2.4).
+      // `system` calibration below still applies on hosts that provide it.
+      const promptField = (event as { prompt?: unknown }).prompt;
+      if (typeof promptField === "string") {
+        (event as { prompt?: unknown }).prompt =
+          sanitizeCompactionPseudoTranscript(promptField);
+      } else if (Array.isArray(promptField)) {
+        for (const part of promptField) {
+          if (
+            part !== null &&
+            typeof part === "object" &&
+            typeof (part as { text?: unknown }).text === "string"
+          ) {
+            (part as { text: string }).text = sanitizeCompactionPseudoTranscript(
+              (part as { text: string }).text,
+            );
+          }
+        }
+      }
+      if (!museCalibration) {
         return;
       }
       if (Array.isArray(event.system)) {

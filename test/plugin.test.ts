@@ -407,26 +407,26 @@ describe("file_hash tools end to end", () => {
     expect(reread.content).toContain("WORLD");
   });
 
-  test("file_hash_edit fails closed on anchor mismatch with disk untouched", async () => {
+  test("file_hash_edit throws fail-closed on anchor mismatch with disk untouched (OH-3.2)", async () => {
     const root = await makeRoot();
     await Bun.write(join(root, "doc.txt"), "hello\nworld\n");
     const host = createFakePluginHost();
     createHarnessPlugin({ rootDir: root }).activate(host.context);
     const editor = host.tools.get("file_hash_edit") as ToolDefinition;
-    const result = (await editor.execute({
-      path: "doc.txt",
-      hunks: [
-        {
-          startLine: 2,
-          startHash: "0000",
-          endLine: 2,
-          endHash: "ffff",
-          replacement: "WORLD",
-        },
-      ],
-    })) as { applied: boolean; error?: string };
-    expect(result.applied).toBe(false);
-    expect(typeof result.error).toBe("string");
+    await expect(
+      editor.execute({
+        path: "doc.txt",
+        hunks: [
+          {
+            startLine: 2,
+            startHash: "0000",
+            endLine: 2,
+            endHash: "ffff",
+            replacement: "WORLD",
+          },
+        ],
+      }),
+    ).rejects.toThrow(/anchor mismatch.*fail-closed/);
     const raw = await Bun.file(join(root, "doc.txt")).text();
     expect(raw).toBe("hello\nworld\n");
   });
@@ -467,20 +467,20 @@ describe("ast tools end to end", () => {
     expect(result.output).toContain('logger.info("b")');
   });
 
-  test("ast_structural_rewrite reports zero matches without modifying", async () => {
+  test("ast_structural_rewrite throws fail-closed on zero matches (OH-3.2)", async () => {
     const root = await makeRoot();
     await Bun.write(join(root, "plain.ts"), "const x = 1;\n");
     const host = createFakePluginHost();
     createHarnessPlugin({ rootDir: root }).activate(host.context);
     const rewrite = host.tools.get("ast_structural_rewrite") as ToolDefinition;
-    const result = (await rewrite.execute({
-      path: "plain.ts",
-      pattern: "console.log($MSG)",
-      rewrite: "logger.info($MSG)",
-    })) as { modified: boolean; matchCount: number; output: string };
-    expect(result.modified).toBe(false);
-    expect(result.matchCount).toBe(0);
-    expect(result.output).toBe("const x = 1;\n");
+    await expect(
+      rewrite.execute({
+        path: "plain.ts",
+        pattern: "console.log($MSG)",
+        rewrite: "logger.info($MSG)",
+      }),
+    ).rejects.toThrow(/no structural match.*fail-closed/);
+    expect(await Bun.file(join(root, "plain.ts")).text()).toBe("const x = 1;\n");
   });
 });
 
@@ -635,7 +635,7 @@ describe("permission hook integration", () => {
       path: "src/index.ts",
     });
     expect(verdict.allowed).toBe(false);
-    expect(verdict.rule).toBe("rule-3-qa-source-lock");
+    expect(verdict.rule).toBe("rule-3a-qa-src-lock");
   });
 
   test("permits agency-qa edits to test and docs paths", async () => {

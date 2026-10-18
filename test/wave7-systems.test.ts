@@ -176,6 +176,26 @@ describe("Wave 7 capability 3: adaptive session.hook('retry') stream & overload 
     expect(outcome2).toEqual({ retry: false });
     expect(authFailEvent.decision).toEqual({ retry: false });
   });
+
+  test("bare-auth signal alone never retries (OH-4.6-bare-auth-retry-untested)", () => {
+    const typeOnly: OpenCodeV2SessionRetryEvent = {
+      sessionID: "s1",
+      error: { type: "auth" },
+      attempt: 1,
+      decision: { retry: true, delay: 2000 },
+    };
+    expect(handleSessionRetryInPlace(typeOnly)).toEqual({ retry: false });
+    expect(typeOnly.decision).toEqual({ retry: false });
+
+    const messageOnly: OpenCodeV2SessionRetryEvent = {
+      sessionID: "s1",
+      error: { message: "credentials rejected (auth)" },
+      attempt: 1,
+      decision: { retry: true, delay: 2000 },
+    };
+    expect(handleSessionRetryInPlace(messageOnly)).toEqual({ retry: false });
+    expect(messageOnly.decision).toEqual({ retry: false });
+  });
 });
 
 describe("Wave 7 capability 4: unused export & orphan module dead-code detector", () => {

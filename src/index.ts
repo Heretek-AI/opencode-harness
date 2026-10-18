@@ -671,7 +671,15 @@ export function buildHarnessTools(
       execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
         enforceHarnessToolGuard(resolved, "file_hash_edit", ctx, args);
         const parsed = fileHashEditSchema.parse(args);
-        return hashEditFile(resolved.rootDir, parsed.path, parsed.hunks);
+        const result = await hashEditFile(resolved.rootDir, parsed.path, parsed.hunks);
+        // OH-3.2: a host-level Success carrying `applied:false` blinds the
+        // doom-loop breaker and contract-impact receipts, so the tool layer
+        // throws fail-closed on anchor mismatch (the `hashEditFile` library
+        // itself still returns `failResult` for direct API use).
+        if (!result.applied) {
+          throw new Error(`file_hash_edit: ${result.error ?? "anchor mismatch"} (fail-closed)`);
+        }
+        return result;
       },
     },
     ast_structural_search: {
@@ -695,13 +703,22 @@ export function buildHarnessTools(
       execute: async (args: Record<string, unknown>, ctx?: ToolContext): Promise<unknown> => {
         enforceHarnessToolGuard(resolved, "ast_structural_rewrite", ctx, args);
         const parsed = astStructuralRewriteSchema.parse(args);
-        return astRewriteFile(
+        const result = await astRewriteFile(
           resolved.rootDir,
           parsed.path,
           parsed.pattern,
           parsed.rewrite,
           parsed.language,
         );
+        // OH-3.2, same pattern as file_hash_edit: a no-match rewrite must
+        // surface as a host-level failure (breaker counts it, callers notice)
+        // rather than a Success carrying `modified:false`.
+        if (!result.modified) {
+          throw new Error(
+            `ast_structural_rewrite: no structural match for pattern ${JSON.stringify(parsed.pattern)} in ${JSON.stringify(parsed.path)} (fail-closed)`,
+          );
+        }
+        return result;
       },
     },
     ui_geometry_audit: {

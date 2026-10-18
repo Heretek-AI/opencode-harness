@@ -31,6 +31,58 @@ const UNTRUSTED_INGESTION_TOOLS = new Set([
  */
 const KNOWN_MCP_SERVER_IDS = ["fallow-mcp", "lsp-mcp-server"];
 
+/**
+ * Tool names the harness itself (or the host's built-in toolset) is known to
+ * produce. Anything else containing `_` is treated as an MCP discovery id
+ * (`<server>_<tool>` — upstream never emits an `mcp_` prefix, and single-word
+ * servers like `tavily`/`fetch` yield `tavily_search`/`fetch_search`) and arms
+ * taint fail-closed (OH-6.6-single-word-mcp-server).
+ */
+const KNOWN_SAFE_TOOL_NAMES = new Set([
+  // Harness tools (`HARNESS_TOOL_NAMES` + `EXTENDED_HARNESS_TOOL_NAMES`).
+  "file_hash_read",
+  "file_hash_edit",
+  "ast_structural_search",
+  "ast_structural_rewrite",
+  "ui_geometry_audit",
+  "repo_map",
+  "blast_radius",
+  "file_outline",
+  "symbol_references",
+  "rename_symbol",
+  "verify_scoped",
+  "architecture_audit",
+  "checkpoint_create",
+  "checkpoint_rollback",
+  // Host built-in tools (read-only and mutating; none ingest third-party
+  // web/MCP content, so none arm taint).
+  "read",
+  "edit",
+  "write",
+  "patch",
+  "multiedit",
+  "apply_patch",
+  "create",
+  "delete",
+  "shell",
+  "bash",
+  "exec",
+  "run",
+  "run_command",
+  "terminal",
+  "glob",
+  "grep",
+  "ls",
+  "list",
+  "task",
+  "subagent",
+  "todo",
+  "todowrite",
+  "todoread",
+  "todo_write",
+  "todo_read",
+]);
+
 export function isUntrustedIngestionTool(toolName: string): boolean {
   const lower = (toolName ?? "").toLowerCase();
   if (lower === "") {
@@ -52,11 +104,20 @@ export function isUntrustedIngestionTool(toolName: string): boolean {
       return true;
     }
   }
+  if (KNOWN_SAFE_TOOL_NAMES.has(lower)) {
+    return false;
+  }
   // Generic MCP discovery id `<server>_<tool>`: a hyphenated server segment
   // before the first `_` distinguishes MCP ids (`my-server_tool`) from
-  // harness `snake_case` tools (`file_hash_read`, `ast_structural_search`).
+  // harness `snake_case` tools (`file_hash_read`, already allowlisted above).
   const underscore = lower.indexOf("_");
   if (underscore > 0 && lower.slice(0, underscore).includes("-")) {
+    return true;
+  }
+  // Fail-closed: any other unknown `_`-containing tool name is an MCP
+  // discovery id from a single-word server (`tavily_search`,
+  // `fetch_search`, `fallow_search`) — arm taint rather than miss it.
+  if (lower.includes("_")) {
     return true;
   }
   return false;

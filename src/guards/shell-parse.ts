@@ -338,8 +338,155 @@ function parseSingleSegment(raw: string): ParsedSegment | null {
   };
 }
 
+export const MAX_SHELL_UNWRAP_DEPTH = 10;
+
+/**
+ * Fail-closed sentinel for recursion-cap exhaustion: when nested interpreter
+ * payloads (`bash -c "..."`, `eval ...`) nest deeper than
+ * `MAX_SHELL_UNWRAP_DEPTH`, the unwrapper cannot prove the payload safe, so it
+ * emits this marker executable and `segmentIsDestructive` treats it as
+ * destructive (deny for every role) rather than silently allowing it.
+ */
+export const UNRESOLVED_NESTING_SENTINEL = "__harness_unresolved_nesting__";
+
+/**
+ * Whether `text` still contains a live code-execution verb (`sh`/`bash`/
+ * `zsh`/`dash`/`ksh`/`eval`). Used only at the unwrap recursion cap to
+ * decide fail-closed (destructive sentinel) vs benign cutoff (`[]`).
+ */
+function containsLiveInterpreterVerb(text: string): boolean {
+  return /\b(sh|bash|zsh|dash|ksh|eval)\b/.test(text);
+}
+
+/**
+ * Long `xargs` options that consume the following token as their value when
+ * given without `=`. Boolean long flags are simply skipped.
+ */
+const XARGS_LONG_VALUE_FLAGS = new Set([
+  "--arg-file",
+  "--delimiter",
+  "--eof",
+  "--replace",
+  "--max-lines",
+  "--max-args",
+  "--max-procs",
+  "--max-chars",
+  "--process-slot-var",
+]);
+
+/** Short `xargs` option letters that require a value (consumed from the same token or the next). */
+const XARGS_SHORT_VALUE_LETTERS = new Set(["a", "d", "E", "I", "L", "n", "P", "s"]);
+/** Short `xargs` option letters with an optional attached value (`-e[EOF]`, `-i[repl]`, `-l[lines]`). */
+const XARGS_SHORT_OPTIONAL_VALUE_LETTERS = new Set(["e", "i", "l"]);
+/** Short `xargs` boolean letters (never consume a value). */
+const XARGS_SHORT_BOOL_LETTERS = new Set(["0", "o", "p", "r", "t", "x", "v"]);
+
+/**
+ * Split `xargs [options] [command [initial-args]]` into the payload command
+ * tokens, preserving the payload verbatim (including its `-rf` flags).
+ * Only xargs's own options are consumed; the first non-option token starts
+ * the payload. A bare `xargs` (no payload, defaults to `echo`) yields `[]`.
+ */
+export function xargsPayloadArgs(args: string[]): string[] {
+  let i = 0;
+  while (i < args.length) {
+    const token = args[i] ?? "";
+    if (token === "--") {
+      return args.slice(i + 1);
+    }
+    if (!token.startsWith("-") || token === "-") {
+      return args.slice(i);
+    }
+    if (token.startsWith("--")) {
+      const eq = token.indexOf("=");
+      const name = eq >= 0 ? token.slice(0, eq) : token;
+      if (XARGS_LONG_VALUE_FLAGS.has(name) && eq < 0) {
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    // Short-option cluster (`-0`, `-r`, `-n1`, `-I{}`, `-d\n`, `-pt`, ...).
+    let j = 1;
+    let consumedNext = false;
+    while (j < token.length) {
+      const letter = token[j] ?? "";
+      if (XARGS_SHORT_VALUE_LETTERS.has(letter)) {
+        if (j + 1 < token.length) {
+          j = token.length;
+        } else {
+          consumedNext = true;
+          j = token.length;
+        }
+        break;
+      }
+      if (XARGS_SHORT_OPTIONAL_VALUE_LETTERS.has(letter)) {
+        j = token.length;
+        break;
+      }
+      if (XARGS_SHORT_BOOL_LETTERS.has(letter)) {
+        j++;
+        continue;
+      }
+      // Unknown short letter: fail-closed toward skipping only this token so
+      // a following payload token is never swallowed as an option value.
+      j++;
+    }
+    i += 1;
+    if (consumedNext) {
+      i += 1;
+    }
+  }
+  return [];
+}
+
+/**
+ * Split `find` `-exec`/`-execdir`/`-ok`/`-okdir` payloads (`-exec cmd {} \;`)
+ * into re-parseable command strings so destructive payloads
+ * (`find . -exec rm -rf / \;`) cannot hide behind the `find` wrapper.
+ */
+export function findExecPayloads(args: string[]): string[] {
+  const payloads: string[] = [];
+  const starters = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+  let i = 0;
+  while (i < args.length) {
+    if (starters.has(args[i] ?? "")) {
+      i++;
+      const parts: string[] = [];
+      while (i < args.length && args[i] !== ";" && args[i] !== "+") {
+        parts.push(args[i] ?? "");
+        i++;
+      }
+      if (parts.length > 0) {
+        payloads.push(parts.join(" "));
+      }
+      if (i < args.length) {
+        i++;
+      }
+    } else {
+      i++;
+    }
+  }
+  return payloads;
+}
 export function parseCommandSegments(command: string, depth: number = 0): ParsedSegment[] {
-  if (depth > 4 || !command.trim()) return [];
+  if (!command.trim()) return [];
+  if (depth > MAX_SHELL_UNWRAP_DEPTH) {
+    if (containsLiveInterpreterVerb(command)) {
+      return [
+        {
+          raw: command.trim(),
+          tokens: [UNRESOLVED_NESTING_SENTINEL],
+          envVars: {},
+          executable: UNRESOLVED_NESTING_SENTINEL,
+          args: [],
+          wrapperChain: [],
+        },
+      ];
+    }
+    return [];
+  }
   const rawSegments = splitShellPipeline(canonicalizeShellCommand(command));
   const parsed: ParsedSegment[] = [];
 
@@ -358,9 +505,13 @@ export function parseCommandSegments(command: string, depth: number = 0): Parsed
     } else if (baseExe === "eval" && seg.args.length > 0) {
       parsed.push(...parseCommandSegments(seg.args.join(" "), depth + 1));
     } else if (baseExe === "xargs" && seg.args.length > 0) {
-      const targetArgs = seg.args.filter((a) => !a.startsWith("-"));
-      if (targetArgs.length > 0) {
-        parsed.push(...parseCommandSegments(targetArgs.join(" "), depth + 1));
+      const payload = xargsPayloadArgs(seg.args);
+      if (payload.length > 0) {
+        parsed.push(...parseCommandSegments(payload.join(" "), depth + 1));
+      }
+    } else if (baseExe === "find" && seg.args.length > 0) {
+      for (const payload of findExecPayloads(seg.args)) {
+        parsed.push(...parseCommandSegments(payload, depth + 1));
       }
     }
 
@@ -404,6 +555,10 @@ function segmentIsDestructive(segment: string): boolean {
   }
   const exe = commandBasename(effective[0] ?? "");
   const args = effective.slice(1);
+
+  if (exe === UNRESOLVED_NESTING_SENTINEL) {
+    return true;
+  }
 
   if (exe === "rm") {
     let hasRecursive = false;
@@ -454,6 +609,27 @@ function segmentIsDestructive(segment: string): boolean {
         if (target.split("/").includes("..")) {
           return true;
         }
+      }
+      // Fail-closed command substitution: a real shell expands `$(...)` and
+      // `` `...` `` before `rm` sees its targets, so `rm -rf $(echo /)` and
+      // `` rm -rf `echo /` `` both wipe root. Any `rm -r[f]` whose segment
+      // carries a substitution is destructive (OH-6.5-backtick-substitution).
+      if (/`[^`]*`|\$\(/.test(segment)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (exe === "find") {
+    // `find / -delete` removes the whole tree: destructive. Scoped deletes
+    // (`find /tmp/x -delete`) stay write-class via `segmentIsWrite`.
+    if (args.includes("-delete")) {
+      const pathArgs = args.filter(
+        (a) => !a.startsWith("-") && a !== ";" && a !== "+" && a !== "{}",
+      );
+      if (pathArgs.some((p) => p === "/" || p === "/*")) {
+        return true;
       }
     }
     return false;

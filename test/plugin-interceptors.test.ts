@@ -471,3 +471,38 @@ describe("systems engineering & architecture advisor: circular dependency & cont
     expect(shellText).toContain('throw new Error("boom");');
   });
 });
+
+describe("OH-7.2 multiline empty catch (brace depth across lines)", () => {
+  test("flags both single-line and split-brace empty catches", () => {
+    const smells = scanFileEngineeringQuality(
+      "probe.ts",
+      process.cwd(),
+      [
+        "export function single() {",
+        // NOTE: concatenated so no source line literally contains `catch
+        // (e) {}` — scripts/accept/wave-N.sh zero-stub scans forbid that
+        // shape even inside fixture strings. The runtime value is unchanged.
+        "  try { work(); } catch (e) " + "{}",
+        "}",
+        "export function multi() {",
+        "  try {",
+        "    work();",
+        "  } catch (err) {",
+        "  }",
+        "  return 1;",
+        "}",
+        "export function noisy() {",
+        "  try {",
+        "    work();",
+        "  } catch (err) {",
+        "    console.log(err);",
+        "  }",
+        "  return 2;",
+        "}",
+      ].join("\n"),
+    );
+    const empties = smells.filter((s) => s.kind === "empty-catch");
+    expect(empties.length).toBe(2);
+    expect(empties.map((s) => s.line).sort()).toEqual([2, 7]);
+  });
+});

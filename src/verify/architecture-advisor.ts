@@ -288,6 +288,42 @@ export function scanFileEngineeringQuality(
         message:
           "Empty catch block silently swallows runtime errors; handle or rethrow with context.",
       });
+      continue;
+    }
+
+    // Multi-line empty catch (`} catch (err) {` … `}` on a later line, the
+    // dominant formatting style): track brace depth from the opener; when
+    // the block closes with no non-blank content inside, it is the same
+    // smell as the single-line form (OH-7.2-multiline-empty-catch-missed).
+    if (/\bcatch\s*(?:\([^)]*\))?\s*\{\s*$/.test(line)) {
+      let depth = 1;
+      let j = i + 1;
+      let onlyBlank = true;
+      for (; j < strippedLines.length && j < i + 1 + 50; j++) {
+        const inner = strippedLines[j] ?? "";
+        for (const ch of inner) {
+          if (ch === "{") {
+            depth++;
+          } else if (ch === "}") {
+            depth--;
+          }
+        }
+        if (depth === 0) {
+          break;
+        }
+        if (inner.trim() !== "") {
+          onlyBlank = false;
+        }
+      }
+      if (depth === 0 && onlyBlank) {
+        smells.push({
+          file: relPath,
+          line: i + 1,
+          kind: "empty-catch",
+          message:
+            "Empty catch block silently swallows runtime errors; handle or rethrow with context.",
+        });
+      }
     }
 
     const fnParamMatch =
