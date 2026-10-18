@@ -1,0 +1,160 @@
+# Red-Proof Sabotage Log — audit-remediation-20261018 (QA)
+# Worktree: worktrees/audit-remediation-20261018, branch audit-remediation-20261018
+# Baseline: a8aa58a + remediation commits (package 1.0.11)
+# Method: each sabotage applied via file edit, `bun test` run for RED proof,
+# then `git checkout -- <file>` restore + green re-run + `git status --short`.
+
+## Gate runs (pristine, pre-sabotage)
+- `bun run check` -> `$ tsc --noEmit`, EXIT 0
+- `bun test` -> `358 pass / 0 fail / 1700 expects / 16 files`, EXIT 0
+- `make check` -> `tsc --noEmit` + `bun test 358/0`, EXIT 0
+- `make accept` -> waves 1-7 `ALL GATES GREEN` (incl. zero-stub, KV-cache,
+  scope-refusal scans), EXIT 0
+- `bun run build` -> `tsc -p tsconfig.build.json`, EXIT 0; `dist/version.js`
+  carries `1.0.11`
+- `bun test test/bootstrap.test.ts` -> 1 pass / 0 fail, EXIT 0
+  (`HARNESS_VERSION === package.json` version `1.0.11`; `src/version.ts`
+  `HARNESS_RELEASE_VERSION = "1.0.11"` consistent)
+- Targeted suites (pristine, each EXIT 0):
+  - `-t "OH-6.5-find-exec-placeholder"` -> 6 tests green
+  - `-t "OH-6.5-guard-root-unwired"` -> 4 tests green
+  - `-t "OH-6.7-lesson-per-read"` -> 1 test green
+  - `-t "OH-6.6-taint-fork-gap"` -> 3 tests green
+  - `-t "post-formatter-receipt"` -> 2 tests green (harness + built-in legs)
+
+## Direct finding probes (pristine, `bun -e`, EXIT 0, "PROBE ALL GREEN")
+- `find / -exec rm -rf {} \;` (+`+`/`-ok`/`-execdir`, `/`/`~` roots):
+  `isDestructiveShellCommand === true` 5/5
+- builder + architect verdicts: `allowed=false, rule=rule-1-destructive`
+- tainted session: `evaluateTaintGuard` -> `deny TAINT-DESTRUCTIVE-1`
+  (taint layer no longer reads `allow` for the wipe idiom)
+- `find /tmp -name x -delete` stays `class=write` (taxonomy preserved)
+- `resolveHarnessOptions({rootDir:"/repo/proj", guardConfig:{lockedContractGlobs:[...]}})`
+  -> `guardConfig.workspaceRoot === "/repo/proj"`
+- fork: tainted-parent child `ssh evil.com` -> `deny`; clean fork -> `allow`
+- OH-6.7 audit-style probe (4x read-ok/edit-fail with POST-TRIP reads +
+  good edit through real adapter `execute.after`, pristine):
+  cycles tripped=false,true,true,true with pending=0,0,0,0;
+  FINAL pending=1 attached to `edit: Recovered via edit ...` (EXIT 0)
+- OH-4.2 formatting-sensitive receipt: covered by the 2 green
+  `post-formatter-receipt` suites (receipt hashes equal post-format disk bytes,
+  no stale pre-format hash).
+
+## Sabotage A — find-exec placeholder wipe (src/guards/shell-parse.ts)
+- Edit: `if (hasRecursive && hasForce && (hasPlaceholder || subst)) {`
+  -> `if (false && hasRecursive && hasForce && (hasPlaceholder || subst)) {`
+  (forces `findExecPayloadIsPlaceholderWipe` to never fire)
+- `bun test` -> `354 pass / 4 fail`, EXIT 1 (RED confirmed; failing tests in
+  `OH-6.5-find-exec-placeholder`, incl. tainted allow-to-deny leg)
+- Restore: `git checkout -- src/guards/shell-parse.ts` -> EXIT 0
+- `git status --short` -> clean (empty)
+
+## Sabotage B1 — lesson re-read carve-out (src/context/episodic-memory.ts)
+- Edit: `if (normalizeToolKind(toolName) === "other") {`
+  -> `if (normalizeToolKind(toolName) === "never-sabotaged") {`
+  (mandated re-reads treated as recovery again)
+- `bun test` -> `358 pass / 0 fail`, EXIT 0 — STAYS GREEN (see Note below)
+- Behavioral probe (audit-style 4-cycle loop with post-trip reads, same as
+  pristine probe above) under this sabotage:
+  `SABOTAGED pending=3` (2x `read: Recovered via read ...` + 1x edit),
+  probe throws `RED AS EXPECTED: got 3 lessons instead of 1`, EXIT 1
+  (RED confirmed at behavioral level — reproduces audit OH-6.7 symptom verbatim)
+- Restore: `git checkout -- src/context/episodic-memory.ts` -> EXIT 0
+- Post-restore `bun test -t "OH-6.7-lesson-per-read"` -> 1 pass, EXIT 0
+- NOTE (test-coverage gap, carried to QA verdict): the shipped
+  `OH-6.7-lesson-per-read` pipeline test performs its re-reads BEFORE the
+  trip is established (read-ok, edit-fail, read-ok, edit-fail, then good edit),
+  so the `=== "other"` carve-out is never exercised by the test and B1 does
+  not fail the suite. The production fix itself is proven load-bearing by the
+  audit-style probe (pristine 1 vs sabotaged 3). Recommend the programmer
+  extend the pipeline test with post-trip re-reads before merge.
+
+## Sabotage B2 — guard-root default (src/index.ts)
+- Edit 1: `guardConfig = { workspaceRoot: rootDir, ...customGuardConfig };`
+  -> `guardConfig = { ...customGuardConfig } as GuardPolicyConfig;`
+- `bun test` -> `358 pass / 0 fail`, EXIT 0 — STAYS GREEN because the
+  second fail-closed layer (blank-normalization block) backfills
+  `workspaceRoot = rootDir` for undefined/blank values (defense in depth).
+- Edit 2 (additionally): `if (typeof guardConfig.workspaceRoot !== "string" || ...)`
+  -> `if (false && (typeof guardConfig.workspaceRoot !== "string" || ...)) {`
+- `bun test` -> `356 pass / 2 fail`, EXIT 1 (RED confirmed; failing tests:
+  `omitted workspaceRoot defaults to rootDir` + `blank workspaceRoot
+  normalizes back to rootDir`)
+- Restore: `git checkout -- src/index.ts` -> EXIT 0
+- Post-restore `bun test` -> `358 pass / 0 fail`, EXIT 0
+
+## Sabotage C — fork taint inheritance (src/interceptors/session-interceptors.ts)
+- Edit: `return SESSION_PARENT_MAP.get(sessionId) ?? SESSION_FORK_MAP.get(sessionId);`
+  -> `return SESSION_PARENT_MAP.get(sessionId);`
+  (fork-map fallback severed; forked children shed taint)
+- `bun test` -> `356 pass / 2 fail`, EXIT 1 (RED confirmed; failing tests:
+  `tainted parent forked child denies exfil` +
+  `fork lineage resolves from session metadata`)
+- Restore: `git checkout -- src/interceptors/session-interceptors.ts` -> EXIT 0
+- Post-restore `bun test` -> `358 pass / 0 fail`, EXIT 0
+
+## Final state
+- `bun test` -> `358 pass / 0 fail / 1700 expects / 16 files`, EXIT 0
+- `git status --short` -> clean (empty; no tracked modifications remain)
+- Only this evidence file added under `docs/evidence/`; no source, test,
+  dispatcher, tag, or publish changes made.
+
+## Re-verify 2026-10-18T08:43:18Z — Rework 1 QA re-check (HEAD 14a2764)
+- Worktree: `worktrees/audit-remediation-20261018`, branch `audit-remediation-20261018`
+- Env: host `/tmp` has 0 free inodes (1048576/1048576, tmpfs 100%), so plain
+  `mkdtemp` in `/tmp` fails ENOSPC. All test runs below use
+  `export TMPDIR=/dev/shm/qa-reverify-tmp` (mkdir -p, removed after). Did NOT
+  delete other sessions' /tmp data.
+- (1) Extended OH-6.7 pipeline test verified in
+  `test/audit-20261018-remediation.test.ts:854-923` (`describe
+  "OH-6.7-lesson-per-read"`, test `pipeline: read-ok, edit-fail, read-ok,
+  edit-fail, good-edit-ok yields 1 lesson on the edit`):
+  sequence `read-ok -> edit-fail -> read-ok -> edit-fail` (trip established on
+  2nd edit-fail, `evaluateSession().triggered === true`, pending 0 throughout),
+  then POST-TRIP `read-ok -> read-ok` each asserting
+  `getPendingLessonProposals(sessionId)` length 0, then `good-edit-ok`
+  asserting pending length 1, `failedCategory === "edit"`,
+  `recoveryAction.startsWith("edit") === true`, no `"via read"`, and no
+  pending item containing `"via read"`. PASS — covers post-trip re-reads and
+  asserts zero pending after re-reads + exactly 1 on good edit.
+- (2) Sabotage B1 re-proof (`src/context/episodic-memory.ts`):
+  - Edit: `if (normalizeToolKind(toolName) === "other") {`
+    -> `if (normalizeToolKind(toolName) === "never-sabotaged") {`
+    (via native edit tool, 1 replacement)
+  - `export TMPDIR=/dev/shm/qa-reverify-tmp; bun test
+    test/audit-20261018-remediation.test.ts -t "OH-6.7-lesson-per-read"`
+    -> `0 pass / 1 fail`, EXIT 1 (RED confirmed; fails at line 902, first
+    post-trip re-read assertion `Expected length: 0 / Received length: 1`).
+  - `git checkout -- src/context/episodic-memory.ts` -> EXIT 0
+  - `git status --short` -> clean (empty), EXIT 0
+  - Post-restore `bun test test/audit-20261018-remediation.test.ts
+    -t "OH-6.7-lesson-per-read"` (same TMPDIR) -> `1 pass / 0 fail /
+    12 expects`, EXIT 0 (GREEN restored).
+  - Pristine pre-sabotage run (same TMPDIR) was also `1 pass / 0 fail`, EXIT 0.
+- (3) Gates (all with `export TMPDIR=/dev/shm/qa-reverify-tmp`):
+  - `bun run check` -> `$ tsc --noEmit`, EXIT 0
+  - `bun test` -> `356 pass / 2 fail / 1703 expects / 358 tests / 16 files`,
+    EXIT 1. The ONLY 2 failures are pre-existing literal-`/tmp` coupling,
+    unrelated to this change:
+    `OH-6.5-redirect-escape > workspace-relative and OS-temp targets still
+    allow for builder` (test/audit-20261018-remediation.test.ts:240) and
+    `OH-6.5-cp-mv-argv-targets > legitimate absolute-source uses with
+    workspace-relative dest allow` (:335) — both assert ALLOW for literal
+    `/tmp/...` paths, which fail-closed to deny when TMPDIR (and thus the
+    OS-temp allow rule) points at `/dev/shm`. OH-6.7 extended test PASSES
+    in this run.
+  - Without TMPDIR override, `bun test -t "OH-6.7-lesson-per-read"` fails
+    `ENOSPC: mkdtemp '/tmp/oh67-lesson-*'` (environmental, expected).
+  - `make check` -> `tsc --noEmit` GREEN + same `356 pass / 2 fail` test
+    result, `make: *** [Makefile:5: check] Error 1`, EXIT 2 (same TMPDIR
+    caveat; the `check` leg itself is EXIT 0).
+  - Full `make accept` NOT re-run: requires writable `/tmp` for temp-creating
+    suites; must be re-confirmed by drift-guard once `/tmp` has free inodes.
+    No production code changed since the last green `make accept` (only this
+    test file in Rework 1).
+- Cleanup: `rm -rf /dev/shm/qa-reverify-tmp` after runs.
+- Tree: `git status --short` shows only
+  `M docs/evidence/audit-remediation-20261018/red-proofs.log` (this append);
+  all sabotage restored. No commit, no tag, no publish.
+- QA verdict: ACCEPT (B1 now RED-proven at suite level; gates green modulo
+  documented TMPDIR env caveat).
