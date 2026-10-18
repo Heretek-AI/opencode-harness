@@ -1,0 +1,129 @@
+# audit-remediation-F — QA Red-Proof Log
+
+Worktree: `/home/john/Projects/Heretek-AI-Rebuild/opencode-harness/worktrees/audit-remediation-F`
+Branch: `audit-remediation-F`
+Programmer commit: `f210bc1dadf1439548a3d4715d7fcd5ac7caca6d` (baseline `6d6a76b`)
+Date (UTC): 2026-10-18
+QA role: `agency-qa` (no subagents spawned; no commits; no release operations)
+
+All sabotage edits applied via the native `edit` tool (never shell redirection)
+and restored immediately via `git checkout -- <file>`.
+
+---
+
+## Sabotage 1 (required): revert F1 predicate — `src/guards/permission-guard.ts`
+
+Condition asserted: `shellTargetEscapesWorkspace` treats ANY leading `~`
+(`if (trimmed.startsWith("~"))`) as a workspace escape → deny
+`rule-0-shell-target-containment` for every role.
+
+Sabotage (one line):
+- before: `if (trimmed.startsWith("~")) {`
+- after:  `if (trimmed === "~" || trimmed.startsWith("~/")) {`
+- Method: native `edit` tool, single replacement in
+  `src/guards/permission-guard.ts`.
+
+Run:
+```bash
+bun test test/audit-20261018-remediation.test.ts -t "tilde-user-target-escape"
+```
+
+Result (RED, as required — non-vacuous):
+```
+ 1 pass
+ 92 filtered out
+ 3 fail
+ 18 expect() calls
+Ran 4 tests across 1 file.
+EXIT:1
+```
+Failures (all three non-control tests):
+- `builder write shapes via ~user/~+/~- deny with rule-0-shell-target-containment` —
+  `expect(verdict.allowed).toBe(false)` got `true`
+- `shellTargetEscapesWorkspace unit semantics for tilde shapes` —
+  `expect(...).toBe(true)` got `false`
+- `legit controls still allow; literal ~foo over-blocks fail-closed` —
+  `expect(overBlocked.allowed).toBe(false)` got `true`
+(The `~`/`~/` control test passes on both predicates, as expected.)
+
+Restore:
+```bash
+git checkout -- src/guards/permission-guard.ts
+git status --short   # empty (clean)
+```
+
+Re-green:
+```bash
+bun test test/audit-20261018-remediation.test.ts -t "tilde-user-target-escape"
+#  4 pass / 92 filtered out / 0 fail / 38 expect() calls — EXIT:0
+```
+
+---
+
+## Sabotage 2 (QA choice, DIFFERENT file/invariant): neuter one `isMcpProvenanceEvent` disjunct — `src/guards/taint-guard.ts`
+
+Condition asserted (remediation-E hardening, F5 residual pin): an event
+carrying an explicit MCP origin marker (`mcpServer`/`mcpServerId`/`mcp_server`/
+`mcpToolId`/`mcp_tool` string keys) returns `isMcpProvenanceEvent(...) === true`.
+This is a DIFFERENT file (`taint-guard.ts`, not `permission-guard.ts`) and a
+DIFFERENT invariant (taint provenance, not shell-target containment) from any
+sabotage the programmer ran (programmer self-proved only the F1 predicate).
+
+Sabotage (one line):
+- before: `if (typeof h[key] === "string" && h[key] !== "") return true;`
+- after:  `if (false && typeof h[key] === "string") return true;`
+- Method: native `edit` tool, single replacement in
+  `src/guards/taint-guard.ts` (neuters the MCP_PROVENANCE_KEYS disjunct; the
+  `origin/source/provider/namespace === "mcp"` leg is left intact).
+
+Run:
+```bash
+bun test test/audit-20261018-remediation.test.ts -t "taint-name-squat"
+```
+
+Result (RED, as required — non-vacuous):
+```
+ 2 pass
+ 92 filtered out
+ 2 fail
+ 15 expect() calls
+Ran 4 tests across 1 file.
+EXIT:1
+```
+Failures:
+- `explicit MCP origin markers arm; bare and unrelated events do not` —
+  `expect(isMcpProvenanceEvent(marked)).toBe(true)` got `false`
+- `squat composition: marked safe-name arms at ingestion, bare squat pins the residual` —
+  `expect(isMcpProvenanceEvent(marked)).toBe(true)` got `false`
+
+Restore:
+```bash
+git checkout -- src/guards/taint-guard.ts
+git status --short   # empty (clean)
+```
+
+Re-green:
+```bash
+bun test test/audit-20261018-remediation.test.ts -t "taint-name-squat"
+#  4 pass / 92 filtered out / 0 fail / 29 expect() calls — EXIT:0
+bun test
+#  397 pass / 0 fail / 2173 expect() calls across 16 files — EXIT:0 (FULL_EXIT:0)
+```
+
+---
+
+## Clean-handoff confirmation
+
+After both sabotage/restore cycles:
+```bash
+git status --short   # empty — worktree clean apart from new QA evidence files below
+```
+
+Only intended modifications remain (programmer's 3 files + this log + the QA
+report; no `src/`/`test/` edits outstanding):
+- `src/guards/permission-guard.ts` (programmer F1 fix, committed)
+- `src/muse/muse-calibration.ts` (programmer F2 fix, committed)
+- `test/audit-20261018-remediation.test.ts` (programmer F1 tests, committed)
+- `docs/reports/audit-remediation-F.md` (programmer stage report, committed)
+- `docs/evidence/audit-remediation-F/red-proofs.log` (this file, uncommitted for drift-guard)
+- `docs/evidence/audit-remediation-F/audit-remediation-F-qa.md` (QA report, uncommitted for drift-guard)
