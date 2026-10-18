@@ -1,0 +1,168 @@
+# P0-1 QA Red-Proof Log — `agency-qa` verifier
+
+- **Issue:** https://github.com/Heretek-AI/opencode-harness/issues/4
+- **Branch:** `main` (working tree, uncommitted P0-1 programmer changes)
+- **Date (UTC):** 2026-10-18
+- **Verifier:** `agency-qa` (no subagents spawned, no commits made)
+- **Scope:** single-session OpenCode v2 plugin only
+
+Backup discipline: P0-1 changes were UNCOMMITTED, so sabotage used
+`cp src/index.ts /tmp/p01-index-fixed.ts` (+ `src/version.ts`) backups with
+`cmp` verification after every restore, instead of `git checkout --`
+(which would have destroyed the programmer's fix). Backup checksums matched
+(`4620aa77...` for `src/index.ts`) before and after each cycle.
+
+## 1. Acceptance gates (all MUST exit 0)
+
+### `bun run check` → EXIT 0
+```
+$ tsc --noEmit
+EXIT:0
+```
+
+### `bun test` → EXIT 0 (276 pass, 0 fail)
+```
+bun test v1.4.2 (744846f84)
+
+ 276 pass
+ 0 fail
+ 1139 expect() calls
+Ran 276 tests across 15 files. [216.00ms]
+EXIT:0
+```
+
+### `bash scripts/accept/run.sh` → EXIT 0
+```
+ok: bun test (full suite incl. wave7-systems)
+ok: bun test test/wave7-systems.test.ts (5 wave7 tests)
+ok: wave-1 regression
+ok: wave-2 regression
+ok: wave-3 regression
+ok: wave-4 regression
+ok: wave-5 regression
+ok: wave-6 regression
+ok: zero-stub scan (no TODO/skip/empty-catch in src, test)
+ok: export present: renameSymbolAcrossWorkspace
+ok: export present: rename_symbol
+ok: export present: buildPostMutationAnchorReceipt
+ok: export present: handleSessionRetryInPlace
+ok: export present: detectUnusedExportsAndOrphanModules
+ok: export present: trackCircuitBreakerAndAutoProposeLesson
+ok: all relative imports in src/ use .js extensions
+ok: scope refusal scan (single-session plugin only)
+WAVE 7 ACCEPT: ALL GATES GREEN
+accept: 7 wave script(s) passed
+EXIT:0
+```
+
+### `bash scripts/accept/wave-8.sh` → EXIT 0
+```
+wave-8: all audit-remediation gates passed
+EXIT:0
+(full output: 276 pass / 0 fail + zero-stub scan "zero hits")
+```
+
+## 2. Direct P0-1 probes (bun one-liners) — ALL PASS
+
+```
+PROBE-OK: setup directory:"" => workspaceRoot=/home/john/Projects/Heretek-AI-Rebuild/opencode-harness
+PROBE-OK: setup directory:"   " => workspaceRoot=/home/john/Projects/Heretek-AI-Rebuild/opencode-harness
+PROBE-OK: setup worktree:"" => workspaceRoot=/home/john/Projects/Heretek-AI-Rebuild/opencode-harness
+PROBE-OK: resolve rootDir:"" threw fail-closed => opencode-harness: rootDir must be a non-empty string (fail-closed)
+PROBE-OK: resolve rootDir:"   " threw fail-closed => opencode-harness: rootDir must be a non-empty string (fail-closed)
+ALL-DIRECT-PROBES-PASS
+EXIT:0
+```
+
+Verified assertions:
+- `setupOpenCodeV2Harness({directory:''})` NO-THROW, `workspaceRoot == process.cwd()` ✓
+- `setupOpenCodeV2Harness({directory:'   '})` NO-THROW ✓
+- `setupOpenCodeV2Harness({worktree:''})` NO-THROW ✓
+- `resolveHarnessOptions({rootDir:''})` THROWS fail-closed ✓
+- `resolveHarnessOptions({rootDir:'   '})` THROWS fail-closed ✓
+
+Also verified `src/index.ts` contains the `pick()` guard:
+```ts
+const pick = (v: unknown): string | undefined =>
+  typeof v === "string" && v.trim() !== "" ? v : undefined;
+const inferredRoot =
+  pick(ctx?.directory) ??
+  pick(ctx?.worktree) ??
+  pick(ctx?.location?.directory) ??
+  pick(ctx?.location?.worktree) ??
+  process.cwd();
+```
+
+## 3. Red-proof sabotage tests (prove the suite FAILS when code is broken)
+
+### S1: revert `pick()` guard → broken `??`-only chain
+- Sabotage command: replaced the `pick()`-guarded `inferredRoot` chain in
+  `src/index.ts` with the broken form:
+  `ctx?.directory ?? ctx?.worktree ?? ctx?.location?.directory ?? ctx?.location?.worktree ?? process.cwd()`
+  → `S1-SABOTAGE-APPLIED`
+- Check command: `bun test test/p0-1-empty-directory.test.ts`
+- Result: **EXIT 1 — 2 pass, 7 fail** (RED as required, proves new tests catch the bug):
+```
+error: expect(received).not.toThrow()
+Error message: "opencode-harness: rootDir must be a non-empty string (fail-closed)"
+(fail) P0-1 empty-directory guard > setup({ directory: '\t\n ' }) whitespace-only falls back to process.cwd()
+ 2 pass
+ 7 fail
+S1-EXIT:1
+```
+- Restore: `cp /tmp/p01-index-fixed.ts src/index.ts` → `cmp` identical → `S1-RESTORE-OK`
+- Re-green: `bun test test/p0-1-empty-directory.test.ts` → **9 pass, 0 fail, EXIT 0**
+
+### S2: break `resolveHarnessOptions` fail-closed (allow empty rootDir)
+- Sabotage command: relaxed the guard in `src/index.ts` from
+  `if (typeof rootDir !== "string" || rootDir.trim() === "")` to
+  `if (typeof rootDir !== "string")` → `S2-SABOTAGE-APPLIED`
+- Check command: `bun test test/plugin.test.ts`
+- Result: **EXIT 1 — 60 pass, 1 fail** (RED as required):
+```
+(fail) mcp config and module wiring > resolveHarnessOptions defaults rootDir and validates budgets
+ 60 pass
+ 1 fail
+S2-EXIT:1
+```
+- Restore: `cp /tmp/p01-index-fixed.ts src/index.ts` → `cmp` identical → `S2-RESTORE-OK`
+- Re-green: `bun test test/plugin.test.ts` → **61 pass, 0 fail, EXIT 0**
+
+### S3: version mismatch (`src/version.ts` 1.0.8 vs `package.json` 1.0.9)
+- Sabotage command: `HARNESS_RELEASE_VERSION "1.0.9"` → `"1.0.8"` in `src/version.ts`
+  → `S3-SABOTAGE-APPLIED`
+- Check command: `bun test test/bootstrap.test.ts`
+- Result: **EXIT 1 — 0 pass, 1 fail** (RED as required):
+```
+(fail) bootstrap entrypoint > exposes the published package identity
+ 0 pass
+ 1 fail
+S3-EXIT:1
+```
+- Restore: `cp /tmp/p01-version-fixed.ts src/version.ts` → `cmp` identical → `S3-RESTORE-OK`
+- Re-green: `bun test test/bootstrap.test.ts` → **1 pass, 0 fail, EXIT 0**
+
+## 4. Final state
+
+- Post-restore integrity: `cmp src/index.ts` and `cmp src/version.ts` against
+  pre-sabotage backups → identical (`FIXES-INTACT`); temp backups removed.
+- Final full suite: `bun test` → **276 pass, 0 fail, EXIT 0**.
+- Final `git status --short` (only expected entries, no leftover sabotage):
+```
+M package.json
+ M src/index.ts
+ M src/version.ts
+?? docs/reports/p0-1.md
+?? test/p0-1-empty-directory.test.ts
+?? docs/evidence/p0-1/red-proofs.log
+```
+
+## QA verdict
+
+All acceptance gates exit 0, all five direct P0-1 probes behave as specified
+(empty/whitespace host roots fall back to `process.cwd()`; direct empty
+`rootDir` still throws fail-closed), and all three sabotage tests prove the
+suite goes RED when the fix (S1), the fail-closed invariant (S2), or the
+version match (S3) is broken — each restored cleanly to green. No stubs,
+mocks, skips, or scope violations observed. P0-1 fix verified. Do NOT merge —
+left uncommitted for Drift Guard verification.

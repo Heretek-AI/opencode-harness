@@ -1052,11 +1052,13 @@ export function setupOpenCodeV2Harness(
       ? (ctx.options as HarnessPluginOptions)
       : undefined;
   const merged: HarnessPluginOptions = { ...hostOptions, ...options };
+  const pick = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() !== "" ? v : undefined;
   const inferredRoot =
-    ctx?.directory ??
-    ctx?.worktree ??
-    ctx?.location?.directory ??
-    ctx?.location?.worktree ??
+    pick(ctx?.directory) ??
+    pick(ctx?.worktree) ??
+    pick(ctx?.location?.directory) ??
+    pick(ctx?.location?.worktree) ??
     process.cwd();
   const resolved = resolveHarnessOptions({
     rootDir: inferredRoot,
