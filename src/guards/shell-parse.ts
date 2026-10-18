@@ -613,7 +613,10 @@ function effectiveTokensOf(segment: string): string[] {
  * execute nothing. They stay `read-only` even though the unknown-verb
  * default is `write` — but only when no redirect/`tee` metacharacters are
  * present (those are checked first and always win: `command -v foo > /etc/x`
- * is still a write).
+ * is still a write). OH-6.5-command-display-doc-drift: `classifyShellCommand`
+ * additionally drops the wrapper-stripped re-render of display queries from
+ * its unwrapped candidates, so this carve-out (which guards the raw segment)
+ * cannot be defeated by the re-rendered lookup name hitting `WRITE_VERBS`.
  */
 function isCommandDisplayQuery(segment: string): boolean {
   const tokens = tokenizeSegment(canonicalizeShellCommand(segment).trim());
@@ -1469,9 +1472,20 @@ export function classifyShellCommand(command: string): ParsedShellCommand {
   const raw = typeof command === "string" ? command : "";
   const canon = canonicalizeShellCommand(raw);
   const segments = splitChain(canon);
-  const unwrapped = parseCommandSegments(canon).map((s) =>
-    `${s.executable} ${s.args.join(" ")}`.trim(),
-  );
+  // OH-6.5-command-display-doc-drift: drop the wrapper-stripped re-render of
+  // `command -v`/`-V` display queries. `stripWithChain` treats `command` as a
+  // wrapper and `consumeWrapper` skips `-v`, so the re-render is just the
+  // looked-up name (`rm`) — which hits `WRITE_VERBS` and defeats the
+  // `isCommandDisplayQuery` carve-out guarding the raw segment. A display
+  // query prints a path and executes nothing, so its re-render is read-only
+  // by construction. Only the re-render is dropped: substitution payloads
+  // unwrapped from the same segment carry their own `raw` (the inner
+  // payload, never the display query) and still scan.
+  const unwrapped = parseCommandSegments(canon)
+    .filter((s) => !isCommandDisplayQuery(s.raw))
+    .map((s) =>
+      `${s.executable} ${s.args.join(" ")}`.trim(),
+    );
   const allCandidates = [...segments, ...unwrapped];
   const targets: string[] = [];
   let sawWrite = false;
