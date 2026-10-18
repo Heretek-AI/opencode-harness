@@ -1630,3 +1630,74 @@ describe("OH-4.2-post-formatter-receipt: built-in edit stand-in proves post-form
     }
   });
 });
+
+describe("OH-6.5-tilde-user-target-escape (audit-remediation-F): ~user/~+/~- write targets confined fail-closed", () => {
+  test("builder write shapes via ~user/~+/~- deny with rule-0-shell-target-containment", () => {
+    const denied = [
+      "echo x > ~root/evil",
+      "echo x | tee ~root/evil",
+      "cp a.txt ~root/evil",
+      "mv a.txt ~other/evil",
+      "echo x > ~+/evil",
+      "echo x > ~-/evil",
+    ];
+    for (const command of denied) {
+      const verdict = evaluateBoardGuard({ role: "builder", tool: "shell", command });
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.rule).toBe("rule-0-shell-target-containment");
+    }
+  });
+
+  test("bare ~ and ~/ still deny with rule-0-shell-target-containment", () => {
+    for (const command of [
+      "echo x > ~",
+      "echo x > ~/evil",
+      "echo x > ~/.ssh/authorized_keys",
+      "echo hi | tee ~/evil",
+    ]) {
+      const verdict = evaluateBoardGuard({ role: "builder", tool: "shell", command });
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.rule).toBe("rule-0-shell-target-containment");
+    }
+  });
+
+  test("shellTargetEscapesWorkspace unit semantics for tilde shapes", () => {
+    const root = makeTempDir("oh65-tilde-");
+    for (const target of [
+      "~",
+      "~/evil",
+      "~/.ssh/authorized_keys",
+      "~root/evil",
+      "~other/evil",
+      "~+/evil",
+      "~-/evil",
+      "~foo",
+    ]) {
+      expect(shellTargetEscapesWorkspace(target, root)).toBe(true);
+    }
+    expect(shellTargetEscapesWorkspace("out.txt", root)).toBe(false);
+    expect(shellTargetEscapesWorkspace("docs/~notes.txt", root)).toBe(false);
+    expect(shellTargetEscapesWorkspace("-", root)).toBe(false);
+    expect(shellTargetEscapesWorkspace("/dev/null", root)).toBe(false);
+  });
+
+  test("legit controls still allow; literal ~foo over-blocks fail-closed (documented cost)", () => {
+    for (const command of [
+      "echo hi > notes.txt",
+      "echo hi > docs/~notes.txt",
+      "echo hi > /tmp/opencode-harness-test/artifact.txt",
+      "echo x 2> /dev/null",
+    ]) {
+      expect(
+        evaluateBoardGuard({ role: "builder", tool: "bash", command }).allowed,
+      ).toBe(true);
+    }
+    const overBlocked = evaluateBoardGuard({
+      role: "builder",
+      tool: "bash",
+      command: "echo hi > ~foo",
+    });
+    expect(overBlocked.allowed).toBe(false);
+    expect(overBlocked.rule).toBe("rule-0-shell-target-containment");
+  });
+});

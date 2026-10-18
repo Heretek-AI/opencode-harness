@@ -513,7 +513,7 @@ export function shellTargetEscapesWorkspace(target: string, workspaceRoot: strin
   if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
     return true;
   }
-  if (trimmed === "~" || trimmed.startsWith("~/")) {
+  if (trimmed.startsWith("~")) {
     return true;
   }
   let abs: string;

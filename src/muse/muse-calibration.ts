@@ -6,7 +6,7 @@ export const MUSE_MODEL_IDENTIFIER = "opencode-go/muse-spark-1.3-contributor"
 
 /**
  * Returns the static, deterministic Muse 1.3 system prompt overlay designed to fix
- * three failure modes in OpenCode V2's default `packages/core/src/system-prompt/meta.txt`:
+ * three failure modes in OpenCode V2's default `packages/core/src/plugin/system-prompt/meta.txt`:
  * 1. `meta.txt` omits `${OPENCODE_TOOL_GUIDANCE}` and encourages subagent spawning for routine reads.
  * 2. Muse 1.3 benefits from 4-hex FNV-1a hash-anchored edits (`file_hash_read` / `file_hash_edit`)
  *    and AST rewrites (`ast_structural_rewrite`) over fragile whitespace-sensitive string replacement.
