@@ -104,7 +104,7 @@ const RECEIPT_SCAN_IGNORED_DIRS = new Set([
 ])
 
 /**
- * List repo-relative file paths under `rootDir` (symlinks skipped, heavy
+ * Repo-relative file paths under `rootDir` (symlinks skipped, heavy
  * directories ignored), sorted, capped at `maxFiles`.
  */
 export function listWorkspaceRelPaths(
@@ -141,12 +141,10 @@ export function listWorkspaceRelPaths(
 }
 
 /**
- * Rescan the workspace for files absent from the pre-execution path set
- * (created files are invisible to a before-only receipt). Returns at most
- * `maxNewFiles` repo-relative paths, sorted, so the mutation receipt can
- * append `before="none"` entries for them. Callers must pass the COMPLETE
- * pre-execution file set (see `listWorkspaceRelPaths`); passing only the
- * top-ranked digest keys would misreport every other pre-existing file.
+ * Files absent from the pre-execution path set (created files are invisible
+ * to a before-only receipt). Pass the COMPLETE set — `beforeDigests.keys()`
+ * post-fix; a ranked-only subset would misreport every other pre-existing
+ * file. Returns at most `maxNewFiles` sorted repo-relative paths.
  */
 export function diffNewWorkspaceFiles(
   knownRelPaths: ReadonlySet<string> | ReadonlyMap<string, unknown>,
@@ -157,6 +155,20 @@ export function diffNewWorkspaceFiles(
   return listWorkspaceRelPaths(rootDir)
     .filter((rel) => !known.has(rel))
     .slice(0, maxNewFiles)
+}
+
+/**
+ * Fail-closed receipt for scan errors / missing snapshots: marks the gap
+ * (`status="degraded"`) instead of a silently-empty receipt (OH-4.8).
+ */
+export function createDegradedMutationReceipt(sessionId: string, reason: string): MutationReceipt {
+  const safeReason = (reason || "workspace-scan-failed").replace(/[<>&"']+/g, "").replace(/-{2,}/g, "-").slice(0, 120) || "workspace-scan-failed"
+  const formattedBlock = [
+    `<mutation-receipt session="${sessionId}" changedFiles="0" status="degraded">`,
+    `  <!-- receipt incomplete: ${safeReason} -->`,
+    `</mutation-receipt>`,
+  ].join("\n")
+  return { sessionId, verifiedAt: "deterministic", totalChanged: 0, files: [], formattedBlock }
 }
 
 export function createMutationReceipt(

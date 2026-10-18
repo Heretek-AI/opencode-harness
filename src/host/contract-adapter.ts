@@ -17,6 +17,7 @@ import type { SessionEvent, SessionMessage } from "../context/context-budget.js"
 import {
   buildMuseSystemOverlay,
   captureWorkspaceDigests,
+  createDegradedMutationReceipt,
   createMutationReceipt,
   diffNewWorkspaceFiles,
   isCompactionAgent,
@@ -36,6 +37,7 @@ import {
 } from "../transactions/edit-transaction.js";
 import {
   evaluateTaintGuard,
+  isMcpProvenanceEvent,
   isUntrustedIngestionTool,
   recordUntrustedContentTaint,
 } from "../guards/taint-guard.js";
@@ -65,7 +67,7 @@ import {
   runArchitectureAudit,
 } from "../verify/architecture-advisor.js";
 import { trackCircuitBreakerAndAutoProposeLesson } from "../context/episodic-memory.js";
-import { buildRepoMap, extractOutline } from "../repomap/repomap.js";
+import { extractOutline } from "../repomap/repomap.js";
 import { getRecommendedMcpConfig } from "../ui-auditor/mcp-defaults.js";
 import type { ToolDefinition } from "../index.js";
 
@@ -291,15 +293,10 @@ const CODEMODE_PINNED_TOOLS = new Set([
 ]);
 
 /**
- * Convert a harness zod (v4) argument schema into a plain JSON Schema object
- * for `ToolEditor.add({ input })` via zod 4's native `z.toJSONSchema()`. The
- * real OpenCode V2 host (`packages/core/src/tool/runtime.ts`) only accepts
- * Effect schemas, Standard JSON Schema implementations, or plain JSON
- * Schema; zod schemas are rejected at registration ("Schema vendor zod does
- * not support JSON Schema conversion") and the tool silently disappears.
- * Arguments are still validated by the zod schema inside each tool's
- * `execute`. Shared subschemas are inlined (`reused: "inline"`) so the
- * output never carries `$ref`/`$defs` the host cannot resolve.
+ * Convert a harness zod (v4) schema to plain JSON Schema for
+ * `ToolEditor.add({ input })` via `z.toJSONSchema()`. The host rejects zod
+ * schemas at registration ("Schema vendor zod does not support JSON Schema
+ * conversion"); shared subschemas inline (`reused: "inline"`, no `$ref`).
  */
 export function toHostInputSchema(schema: ZodTypeAny): Record<string, unknown> {
   const json = z.toJSONSchema(schema, {
@@ -417,7 +414,8 @@ export function wireOpenCodeV2PromiseContext(params: {
     string,
     Map<string, string | null>
   >();
-  const preSubagentFileSetBySession = new Map<string, Set<string>>();
+  // OH-4.8 degraded marker: scan failures here become `status="degraded"` receipts.
+  const preSubagentDegradedBySession = new Map<string, string>();
   const pendingReadSuggestions = new Map<string, string[]>();
 
   // 1. Register direct top-level tools (`options: { codemode: false }`) AND, when the host
@@ -643,16 +641,17 @@ export function wireOpenCodeV2PromiseContext(params: {
 
       // Snapshot workspace digests before subagent execution to verify ground-truth mutations
       if (toolName === "subagent") {
-        const map = buildRepoMap(workspaceRoot, 500);
-        const digests = captureWorkspaceDigests(
-          map.rankedFiles.map((f) => f.absPath),
-          workspaceRoot,
-        );
-        preSubagentDigestsBySession.set(sessionId, digests);
-        preSubagentFileSetBySession.set(
-          sessionId,
-          new Set(listWorkspaceRelPaths(workspaceRoot)),
-        );
+        // OH-4.8: digest the FULL file set, not the top-500 ranked code
+        // files, so unranked modifies/deletes are receipted (the 500 cap
+        // stays on the RepoMap display only). Scan errors record a degraded
+        // marker, never a silently-empty receipt.
+        try {
+          const allRel = listWorkspaceRelPaths(workspaceRoot);
+          preSubagentDigestsBySession.set(sessionId, captureWorkspaceDigests(allRel, workspaceRoot));
+        } catch {
+          preSubagentDegradedBySession.set(sessionId, "before-snapshot-scan-failed");
+          preSubagentDigestsBySession.delete(sessionId);
+        }
       }
 
       if (MUTATING_FILE_TOOLS.has(toolName)) {
@@ -723,7 +722,10 @@ export function wireOpenCodeV2PromiseContext(params: {
           }
         }
 
-        if (isUntrustedIngestionTool(toolName) && ok) {
+        // OH-6.6-taint-name-squat: arm on the bare discovery name OR on an
+        // MCP provenance marker, so a squat id that exactly equals a
+        // safe-list entry still taints when the event carries MCP origin.
+        if ((isUntrustedIngestionTool(toolName) || isMcpProvenanceEvent(event)) && ok) {
           recordUntrustedContentTaint(sessionId, toolName);
         }
 
@@ -796,32 +798,38 @@ export function wireOpenCodeV2PromiseContext(params: {
           }
           const beforeDigests = preSubagentDigestsBySession.get(sessionId);
           preSubagentDigestsBySession.delete(sessionId);
-          const beforeFileSet = preSubagentFileSetBySession.get(sessionId);
-          preSubagentFileSetBySession.delete(sessionId);
-          if (beforeDigests && ok) {
-            // Rescan against the COMPLETE pre-execution file set so created
-            // files are appended as `before="none"` entries instead of
-            // staying invisible (OH-4.8).
-            const knownSet =
-              beforeFileSet ?? new Set<string>(beforeDigests.keys());
-            const freshFiles = diffNewWorkspaceFiles(knownSet, workspaceRoot);
-            const receipt = createMutationReceipt(
-              outObj?.sessionID ?? sessionId,
-              beforeDigests,
-              workspaceRoot,
-              freshFiles,
-            );
-            appendedBlocks.push(receipt.formattedBlock);
-            for (const changed of receipt.files.filter(
-              (f) => f.changed && f.existsAfter,
-            )) {
-              const diag = collectFileDiagnostics(
-                changed.relPath,
+          const degradedReason = preSubagentDegradedBySession.get(sessionId);
+          preSubagentDegradedBySession.delete(sessionId);
+          if (degradedReason !== undefined || beforeDigests === undefined) {
+            // Fail-closed: scan error (or missing snapshot) degrades loudly
+            // instead of a silently-empty receipt (OH-4.8).
+            appendedBlocks.push(createDegradedMutationReceipt(outObj?.sessionID ?? sessionId, degradedReason ?? "no-before-snapshot").formattedBlock);
+          } else if (ok) {
+            // Rescan the COMPLETE pre-execution set so created files append
+            // as `before="none"` (OH-4.8); unranked modifies/deletes are
+            // covered because before-digests now span the full set.
+            try {
+              const freshFiles = diffNewWorkspaceFiles(new Set<string>(beforeDigests.keys()), workspaceRoot);
+              const receipt = createMutationReceipt(
+                outObj?.sessionID ?? sessionId,
+                beforeDigests,
                 workspaceRoot,
+                freshFiles,
               );
-              if (!diag.clean && diag.formattedTag) {
-                appendedBlocks.push(diag.formattedTag);
+              appendedBlocks.push(receipt.formattedBlock);
+              for (const changed of receipt.files.filter(
+                (f) => f.changed && f.existsAfter,
+              )) {
+                const diag = collectFileDiagnostics(
+                  changed.relPath,
+                  workspaceRoot,
+                );
+                if (!diag.clean && diag.formattedTag) {
+                  appendedBlocks.push(diag.formattedTag);
+                }
               }
+            } catch {
+              appendedBlocks.push(createDegradedMutationReceipt(outObj?.sessionID ?? sessionId, "after-rescan-failed").formattedBlock);
             }
           }
         }

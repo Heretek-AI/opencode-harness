@@ -33,9 +33,9 @@ const UNTRUSTED_INGESTION_TOOLS = new Set([
 ]);
 
 /**
- * MCP server ids whose `<server>_<tool>` discovery names must arm taint.
- * Upstream names MCP tools `server_tool` with no `mcp_` prefix, so the
- * historic `mcp_`-prefix check never fired for the recommended servers.
+ * MCP server ids whose `<server>_<tool>` discovery names must arm taint
+ * (upstream MCP tools are `server_tool` with no `mcp_` prefix, so the
+ * historic `mcp_`-prefix check never fired for the recommended servers).
  */
 const KNOWN_MCP_SERVER_IDS = ["fallow-mcp", "lsp-mcp-server"];
 
@@ -45,6 +45,12 @@ const KNOWN_MCP_SERVER_IDS = ["fallow-mcp", "lsp-mcp-server"];
  * (`<server>_<tool>` — upstream never emits an `mcp_` prefix, and single-word
  * servers like `tavily`/`fetch` yield `tavily_search`/`fetch_search`) and arms
  * taint fail-closed (OH-6.6-single-word-mcp-server).
+ *
+ * OH-6.6-taint-name-squat (documented residual): allowlist matches the BARE
+ * discovery name only — the event path carries no MCP namespace marker, so
+ * an exact-match hostile id (server `file_hash` + tool `read`) returns
+ * `taint=false`. Hardening is `isMcpProvenanceEvent`, armed alongside this
+ * check at ingestion: marked squats arm taint, bare built-ins keep allow.
  */
 const KNOWN_SAFE_TOOL_NAMES = new Set([
   // Harness tools (`HARNESS_TOOL_NAMES` + `EXTENDED_HARNESS_TOOL_NAMES`).
@@ -115,9 +121,8 @@ export function isUntrustedIngestionTool(toolName: string): boolean {
   if (KNOWN_SAFE_TOOL_NAMES.has(lower)) {
     return false;
   }
-  // Generic MCP discovery id `<server>_<tool>`: a hyphenated server segment
-  // before the first `_` distinguishes MCP ids (`my-server_tool`) from
-  // harness `snake_case` tools (`file_hash_read`, already allowlisted above).
+  // Hyphenated server segment before the first `_` (`my-server_tool`) vs
+  // harness `snake_case` tools (allowlisted above).
   const underscore = lower.indexOf("_");
   if (underscore > 0 && lower.slice(0, underscore).includes("-")) {
     return true;
@@ -129,6 +134,38 @@ export function isUntrustedIngestionTool(toolName: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * OH-6.6-taint-name-squat: `true` when a tool event carries an explicit MCP
+ * origin marker, so a squat id equal to a safe-list entry still arms taint.
+ * Only exact-key markers count (never substrings/arg values); no marker
+ * returns `false`. Never throws.
+ */
+const MCP_PROVENANCE_KEYS = ["mcpServer", "mcpServerId", "mcp_server", "mcpToolId", "mcp_tool"];
+
+export function isMcpProvenanceEvent(event: unknown): boolean {
+  try {
+    if (event === null || typeof event !== "object") return false;
+    const record = event as Record<string, unknown>;
+    const result = record.result as Record<string, unknown> | undefined;
+    const holders = [record, record.input, record.metadata, record.headers, result, result?.metadata];
+    for (const holder of holders) {
+      if (holder === null || typeof holder !== "object") continue;
+      const h = holder as Record<string, unknown>;
+      for (const key of MCP_PROVENANCE_KEYS) {
+        if (typeof h[key] === "string" && h[key] !== "") return true;
+      }
+      for (const key of ["origin", "source", "provider", "namespace"]) {
+        if (typeof h[key] === "string" && (h[key] as string).toLowerCase() === "mcp") {
+          return true;
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export function recordUntrustedContentTaint(
@@ -159,13 +196,10 @@ export function clearTaintState(sessionId?: string): void {
 }
 
 /**
- * Resolve the nearest taint records for `sessionId`, walking up the
- * `recordSessionParentLink`/`recordSessionForkLink` subagent/fork/compaction
- * chain so child sessions inherit their parent's taint (fail-closed: a fork
- * of a tainted session is tainted; a forged clean-parent link allows
- * exactly like no link). Residual gap: silent host-level forks (no
- * promise-plugin hook event) link nothing — hosts MUST call exported
- * `recordSessionForkLink(child, parent)` at fork time.
+ * Walk the parent/fork chain so children inherit parent taint (fail-closed:
+ * a fork of a tainted session is tainted; a forged clean-parent link allows
+ * like no link). Residual: silent host-level forks link nothing — hosts MUST
+ * call exported `recordSessionForkLink(child, parent)` at fork time.
  */
 function resolveTaintChain(sessionId: string): TaintRecord[] {
   const visited = new Set<string>();
@@ -186,10 +220,9 @@ function denyTaint(ruleId: string, reason: string): TaintVerdict {
 }
 
 /**
- * OH-6.6-redirect-taint-blindspot: `true` when a path (file-tool target or
- * shell redirect/`tee`/argv target) names a credential or hook location the
- * tainted session must not touch. Shared by the `file` branch and the shell
- * branch so the two layers cannot diverge.
+ * OH-6.6-redirect-taint-blindspot: `true` when a path names a credential or
+ * hook location the tainted session must not touch. Shared by the `file`
+ * and shell branches so the two layers cannot diverge.
  */
 export function matchesTaintSensitivePath(commandOrPath: string): boolean {
   const norm = (commandOrPath ?? "").replace(/\\/g, "/");
@@ -207,10 +240,9 @@ export function matchesTaintSensitivePath(commandOrPath: string): boolean {
 }
 
 /**
- * OH-6.6-exec-taint-evasion: the effective executable of one parsed segment
- * after stripping privilege/env wrappers (`exec`, `timeout 5`, `sudo -u
- * root`, …) with the shared G-01 wrapper set. Falls back to the raw segment
- * executable (then the wrapper chain tail) when stripping yields nothing.
+ * OH-6.6-exec-taint-evasion: effective executable after stripping
+ * privilege/env wrappers with the shared G-01 wrapper set; falls back to
+ * the raw executable, then the wrapper chain tail.
  */
 export function taintEffectiveExecutable(seg: {
   tokens: string[];
@@ -233,20 +265,15 @@ export function taintEffectiveExecutable(seg: {
 }
 
 /**
- * Evaluates whether a shell command or sensitive file mutation in a tainted session
- * attempts to exfiltrate credentials, pipe remote scripts to a shell, or mutate git hooks.
+ * Deny exfil/wipe/credential-touching shell or sensitive file mutations in a
+ * tainted session.
  *
- * OH-6.6-taint-fork-gap (audit-remediation-D): accepts an optional 4th param
- * `eventContext?: unknown` carrying the live host event (permission-evaluate
- * event, tool event, or any carrier of fork metadata). When provided, calls
- * `linkForkLineageFromEventMetadata(sessionId, eventContext)` FIRST (never
- * throws; unparseable/junk/self/empty values link nothing) before
- * `resolveTaintChain`, so a forked child whose first observable event is the
- * guarded action itself still inherits its tainted parent's taint in the same
- * call. 3-arg callers are unaffected (no linkage attempted when the param is
- * omitted). Residual gap: a silent host-level fork whose event carries NO
- * fork id links nothing — hosts MUST call exported
- * `recordSessionForkLink(child, parent)` at fork time.
+ * OH-6.6-taint-fork-gap (remediation-D): optional 4th param `eventContext`
+ * carries the live host event; when provided, fork lineage links FIRST
+ * (never throws; junk/self/empty link nothing) so a forked child whose
+ * first observable event is the guarded action still inherits taint in the
+ * same call. Residual: a silent fork whose event carries NO fork id links
+ * nothing — hosts MUST call `recordSessionForkLink(child, parent)`.
  */
 export function evaluateTaintGuard(
   sessionId: string,
@@ -266,9 +293,7 @@ export function evaluateTaintGuard(
     taints[taints.length - 1]?.sourceTool ?? "untrusted-source";
 
   // OH-6.5-find-exec-placeholder: while tainted, a destructive shell command
-  // (`find / -exec rm -rf {} \;`, `rm -rf /`, …) denies fail-closed at the
-  // taint layer too. The permission layer denies it for every role first,
-  // but taint must never read as `allow` for a wipe idiom.
+  // denies fail-closed at the taint layer too (never `allow` a wipe idiom).
   if (actionType === "shell" && isDestructiveShellCommand(commandOrPath)) {
     return denyTaint(
       "TAINT-DESTRUCTIVE-1",
@@ -286,11 +311,9 @@ export function evaluateTaintGuard(
     return { action: "allow" };
   }
 
-  // OH-6.6-redirect-taint-blindspot: while tainted, a shell redirect/`tee`
-  // (or `cp`/`mv`/`ln`/`install`/`sed -i` argv) target naming a sensitive
-  // credential/hook path denies with TAINT-FILE-1 — the permission guard is
-  // the wrong layer to rely on here because tainted privileged roles
-  // (`architect`, `builder`) pass it by design.
+  // OH-6.6-redirect-taint-blindspot: while tainted, a redirect/`tee`/argv
+  // target naming a sensitive path denies with TAINT-FILE-1 (privileged
+  // roles pass the permission guard by design, so this layer must catch it).
   for (const target of [
     ...shellNamedFileTargets(commandOrPath),
     ...shellArgvFileTargets(commandOrPath),

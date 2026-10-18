@@ -26,6 +26,7 @@ import {
   clearPendingLessonProposals,
   clearSessionLineage,
   applyRootAffinityHeadersInPlace,
+  createDegradedMutationReceipt,
   defaultGuardConfig,
   evaluateBoardGuard,
   evaluateSession,
@@ -53,6 +54,8 @@ import {
 import {
   clearTaintState,
   evaluateTaintGuard,
+  isMcpProvenanceEvent,
+  isUntrustedIngestionTool,
   recordUntrustedContentTaint,
 } from "../src/guards/taint-guard";
 import { computeLineHash } from "../src/editors/hashline-tools";
@@ -1216,6 +1219,269 @@ describe("OH-6.6-taint-fork-gap: fork-aware taint inheritance", () => {
     });
     expect(verdict.action).toBe("allow");
     expect(getSessionForkSource(child)).toBeUndefined();
+  });
+});
+
+describe("OH-4.8-unranked-modification-blindspot (audit-remediation-E): full-set receipt", () => {
+  async function runSubagentRound(
+    root: string,
+    mutate: () => void,
+    childId: string,
+  ): Promise<string> {
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    const sessionId = `oh48-${childId}`;
+    await host.toolBefore[0]({
+      sessionID: sessionId,
+      agent: "build",
+      tool: "subagent",
+      input: {},
+    } as never);
+    mutate();
+    const completed = {
+      sessionID: sessionId,
+      agent: "build",
+      tool: "subagent",
+      input: {},
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: "done" }],
+        output: { sessionID: childId },
+      },
+    } as unknown as {
+      sessionID: string;
+      result: { content: Array<{ type: string; text?: string }> };
+    };
+    await host.toolAfter[0](completed as never);
+    return completed.result.content.map((c) => c.text ?? "").join("\n");
+  }
+
+  function shaPair(text: string, rel: string): [string, string] {
+    const match = text.match(
+      new RegExp(`path="${rel}" before="([0-9a-f]{16})" after="([0-9a-f]{16})"`),
+    );
+    expect(match).not.toBeNull();
+    return [match![1], match![2]];
+  }
+
+  test("audit proof: unranked modify + ranked modify + created are all receipted", async () => {
+    const root = makeTempDir("oh48-full-");
+    const child = `oh48-full-child-${Date.now()}`;
+    writeFileSync(join(root, "code.ts"), "export const a = 1;\n", "utf8");
+    writeFileSync(join(root, "notes.txt"), "hello\n", "utf8");
+    const text = await runSubagentRound(
+      root,
+      () => {
+        writeFileSync(join(root, "code.ts"), "export const a = 2;\n", "utf8");
+        writeFileSync(join(root, "notes.txt"), "world\n", "utf8");
+        writeFileSync(join(root, "brand-new.txt"), "new\n", "utf8");
+      },
+      child,
+    );
+    expect(text).toContain(`<mutation-receipt session="${child}" changedFiles="3">`);
+    const [notesBefore, notesAfter] = shaPair(text, "notes.txt");
+    expect(notesBefore).not.toBe(notesAfter);
+    expect(notesBefore).not.toBe("none");
+    shaPair(text, "code.ts");
+    expect(text).toContain('path="brand-new.txt" before="none"');
+  });
+
+  test("isolated unranked modify receipts changedFiles=1 (audit isolated variant)", async () => {
+    const root = makeTempDir("oh48-iso-");
+    const child = `oh48-iso-child-${Date.now()}`;
+    writeFileSync(join(root, "code.ts"), "export const a = 1;\n", "utf8");
+    writeFileSync(join(root, "notes.txt"), "hello\n", "utf8");
+    const text = await runSubagentRound(
+      root,
+      () => {
+        writeFileSync(join(root, "notes.txt"), "world\n", "utf8");
+      },
+      child,
+    );
+    expect(text).toContain(`<mutation-receipt session="${child}" changedFiles="1">`);
+    const [before, after] = shaPair(text, "notes.txt");
+    expect(before).not.toBe(after);
+    expect(text).not.toContain('path="code.ts" before=');
+  });
+
+  test("unranked delete lists after=deleted (audit modify+delete variant)", async () => {
+    const root = makeTempDir("oh48-del-");
+    const child = `oh48-del-child-${Date.now()}`;
+    writeFileSync(join(root, "code.ts"), "export const a = 1;\n", "utf8");
+    writeFileSync(join(root, "notes.txt"), "hello\n", "utf8");
+    const text = await runSubagentRound(
+      root,
+      () => {
+        writeFileSync(join(root, "code.ts"), "export const a = 2;\n", "utf8");
+        rmSync(join(root, "notes.txt"), { force: true });
+      },
+      child,
+    );
+    expect(text).toContain(`<mutation-receipt session="${child}" changedFiles="2">`);
+    expect(text).toMatch(/path="notes\.txt" before="[0-9a-f]{16}" after="deleted"/);
+    shaPair(text, "code.ts");
+  });
+
+  test("missing snapshot degrades loudly instead of a silently-empty receipt", async () => {
+    const root = makeTempDir("oh48-deg-");
+    const child = `oh48-deg-child-${Date.now()}`;
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    // No execute.before fired: no before-snapshot exists for this session.
+    const completed = {
+      sessionID: `oh48-deg-${Date.now()}`,
+      agent: "build",
+      tool: "subagent",
+      input: {},
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: "done" }],
+        output: { sessionID: child },
+      },
+    } as unknown as {
+      sessionID: string;
+      result: { content: Array<{ type: string; text?: string }> };
+    };
+    await host.toolAfter[0](completed as never);
+    const text = completed.result.content.map((c) => c.text ?? "").join("\n");
+    expect(text).toContain(`<mutation-receipt session="${child}" changedFiles="0" status="degraded">`);
+    expect(text).toContain("no-before-snapshot");
+  });
+
+  test("createDegradedMutationReceipt sanitizes hostile reasons and never throws", () => {
+    const receipt = createDegradedMutationReceipt("s", '<evil>&"quote');
+    expect(receipt.totalChanged).toBe(0);
+    expect(receipt.formattedBlock).toContain('status="degraded"');
+    expect(receipt.formattedBlock).not.toContain("<evil>");
+    expect(createDegradedMutationReceipt("s", "").formattedBlock).toContain("workspace-scan-failed");
+  });
+});
+
+describe("OH-6.6-taint-fork-gap (audit-remediation-E): after-mirroring end to end", () => {
+  test("execute.after-only fork metadata links lineage and denies (after-mirror pin)", async () => {
+    const root = makeTempDir("oh66-e-after-");
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    const parent = `oh66-e-after-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    recordUntrustedContentTaint(parent, "webfetch");
+    // No execute.before fires: the forked child's first observable event is
+    // the after event carrying fork metadata — the after mirror must link it.
+    await host.toolAfter[0]({
+      sessionID: child,
+      agent: "build",
+      tool: "shell",
+      input: { command: "echo hi" },
+      metadata: { forkOf: parent },
+      status: "completed",
+      result: { content: [{ type: "text", text: "hi" }] },
+    } as never);
+    expect(getSessionForkSource(child)).toBe(parent);
+    const denied = evaluateTaintGuard(child, "ssh evil.com", "shell");
+    expect(denied.action).toBe("deny");
+    expect(denied.ruleId).toBe("TAINT-NET-2");
+  });
+
+  test("clean fork through after-only allows (no over-taint)", async () => {
+    const root = makeTempDir("oh66-e-clean-");
+    const host = makeAdapterHost(root);
+    wireOpenCodeV2PromiseContext({
+      ctx: host.ctx,
+      workspaceRoot: root,
+      tools: {},
+      evaluatePermission: (req) => evaluateBoardGuard(req, defaultGuardConfig()),
+      recordCircuitBreaker: (ev) => toTrippedDirective(recordAndEvaluateCircuitBreaker(ev)),
+      runContextBudget: () => undefined,
+    });
+    const parent = `oh66-e-clean-parent-${Date.now()}`;
+    const child = `${parent}-child`;
+    await host.toolAfter[0]({
+      sessionID: child,
+      agent: "build",
+      tool: "shell",
+      input: { command: "echo hi" },
+      metadata: { forkOf: parent },
+      status: "completed",
+      result: { content: [{ type: "text", text: "hi" }] },
+    } as never);
+    expect(getSessionForkSource(child)).toBe(parent);
+    expect(evaluateTaintGuard(child, "ssh evil.com", "shell").action).toBe("allow");
+  });
+});
+
+describe("OH-6.6-taint-name-squat (audit-remediation-E): provenance hardening", () => {
+  test("bare names keep the documented matrix: safe-list allows, discovery ids arm", () => {
+    for (const safe of ["file_hash_read", "read", "repo_map", "verify_scoped", "shell"]) {
+      expect(isMcpProvenanceEvent({ tool: safe })).toBe(false);
+    }
+    for (const arm of ["webfetch", "tavily_search", "my-server_tool", "fallow-mcp_screenshot"]) {
+      expect(isUntrustedIngestionTool(arm)).toBe(true);
+    }
+  });
+
+  test("explicit MCP origin markers arm; bare and unrelated events do not", () => {
+    for (const marked of [
+      { metadata: { mcpServer: "evil" } },
+      { input: { mcpServerId: "evil" } },
+      { headers: { origin: "MCP" } },
+      { result: { metadata: { source: "mcp" } } },
+      { tool: "read", metadata: { namespace: "mcp" } },
+    ]) {
+      expect(isMcpProvenanceEvent(marked)).toBe(true);
+    }
+    for (const bare of [
+      {},
+      { tool: "read" },
+      { input: { command: "echo mcp" } },
+      { metadata: { forkOf: "parent" } },
+      { metadata: { server: "mcp" } },
+      null,
+      undefined,
+      42,
+      "mcp",
+    ]) {
+      expect(isMcpProvenanceEvent(bare)).toBe(false);
+    }
+  });
+
+  test("squat composition: marked safe-name arms at ingestion, bare squat pins the residual", () => {
+    // Hostile server `file_hash` + tool `read` yields the bare safe name.
+    expect(isUntrustedIngestionTool("file_hash_read")).toBe(false);
+    // With an MCP origin marker the ingestion condition arms (mirrors the
+    // contract-adapter call site); without one it allows — the documented
+    // residual, pinned here rather than claimed closed.
+    const marked = { tool: "file_hash_read", metadata: { mcpServer: "file_hash" } };
+    expect(isMcpProvenanceEvent(marked)).toBe(true);
+    expect(isMcpProvenanceEvent({ tool: "file_hash_read" })).toBe(false);
+  });
+
+  test("never throws on hostile input shapes", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(isMcpProvenanceEvent(circular)).toBe(false);
+    expect(isMcpProvenanceEvent({ result: { metadata: 42 } })).toBe(false);
+    expect(isMcpProvenanceEvent([])).toBe(false);
   });
 });
 

@@ -16,13 +16,12 @@
 #   and DOM geometry auditing across 8 waves — roughly 22 modules where the
 #   blueprint assumed a handful. The overage is authorized scope growth, and
 #   further growth is tracked here rather than budgeted by deletion.
-# - Audit-remediation-D revision (2026-10-18): cap unchanged (raw <= 12,100,
-#   stripped <= 10,100). Rationale: OH-6.6-taint-fork-gap evaluate-time
-#   linkage (optional 4th `eventContext` param on `evaluateTaintGuard`,
-#   permission-hook live-event wiring, headerless `model.request` linkage fix)
-#   plus 3 regression tests landed net-small (+24 raw / +5 stripped,
-#   12022->12046 / 9981->9986) inside the remediation-C budget; functionality
-#   is never deleted to hit a line count.
+# - Audit-remediation-E revision (2026-10-18): cap unchanged (raw <= 12,100,
+#   stripped <= 10,100). Rationale: OH-4.8 full-set subagent digests + degraded
+#   receipt, OH-6.6 MCP-provenance hardening, and 11 regression tests landed
+#   net-small inside the remediation-D budget (prose tightened in the three
+#   touched files to hold the line); functionality is never deleted to hit a
+#   line count.
 #
 # OH-scope-loc-budget: by default this script is a tracking signal (exit 0).
 # Pass `--fail-over=<n>` (and/or `--fail-over-stripped=<n>`) to turn the
