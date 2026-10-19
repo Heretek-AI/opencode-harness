@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, isAbsolute, resolve } from "node:path"
 import { isPathWithinRoot } from "../editors/hashline-tools.js"
 
@@ -38,21 +38,26 @@ const SESSION_READ_TIMESTAMPS = new Map<string, Map<string, number>>()
 let txCounter = 0
 
 function captureSnapshot(absPath: string): FileSnapshot {
-  if (!existsSync(absPath)) {
+  try {
+    const st = statSync(absPath)
+    const content = readFileSync(absPath)
+    return {
+      absPath,
+      existed: true,
+      content,
+      mtimeMs: st.mtimeMs,
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code
+    if (code !== undefined && code !== "ENOENT") {
+      throw err
+    }
     return {
       absPath,
       existed: false,
       content: null,
       mtimeMs: null,
     }
-  }
-  const st = statSync(absPath)
-  const content = readFileSync(absPath)
-  return {
-    absPath,
-    existed: true,
-    content,
-    mtimeMs: st.mtimeMs,
   }
 }
 
@@ -62,8 +67,16 @@ function restoreSnapshot(snap: FileSnapshot): "restored" | "removed" | "noop" {
     writeFileSync(snap.absPath, snap.content)
     return "restored"
   }
-  if (!snap.existed && existsSync(snap.absPath)) {
-    rmSync(snap.absPath, { force: true })
+  if (!snap.existed) {
+    try {
+      rmSync(snap.absPath, { force: true })
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code
+      if (code !== undefined && code !== "ENOENT") {
+        throw err
+      }
+      return "noop"
+    }
     return "removed"
   }
   return "noop"
@@ -263,7 +276,6 @@ export function recordFileReadTimestamp(
   workspaceRoot: string = process.cwd(),
 ): void {
   const absPath = isAbsolute(filePath) ? filePath : resolve(workspaceRoot, filePath)
-  if (!existsSync(absPath)) return
   try {
     const st = statSync(absPath)
     let map = SESSION_READ_TIMESTAMPS.get(sessionId)
@@ -291,8 +303,15 @@ export function checkStaleFileRead(
   requirePriorRead: boolean = false,
 ): StaleReadCheckResult {
   const absPath = isAbsolute(filePath) ? filePath : resolve(workspaceRoot, filePath)
-  if (!existsSync(absPath)) {
-    return { stale: false, unread: false, filePath: absPath }
+  let diskMtimeMs: number | null = null
+  try {
+    diskMtimeMs = statSync(absPath).mtimeMs
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code
+    if (code === "ENOENT" || code === undefined) {
+      return { stale: false, unread: false, filePath: absPath }
+    }
+    throw err
   }
 
   const map = SESSION_READ_TIMESTAMPS.get(sessionId)
@@ -310,19 +329,14 @@ export function checkStaleFileRead(
     return { stale: false, unread: true, filePath: absPath }
   }
 
-  try {
-    const st = statSync(absPath)
-    // Allow 2ms tolerance for filesystem timestamp quantization
-    if (st.mtimeMs > lastReadMtime + 2) {
-      return {
-        stale: true,
-        unread: false,
-        filePath: absPath,
-        reason: `File "${absPath}" was modified on disk since your last read (lastRead=${Math.round(lastReadMtime)}, current=${Math.round(st.mtimeMs)}). Re-read the file before editing to prevent clobbering concurrent changes.`,
-      }
+  // Allow 2ms tolerance for filesystem timestamp quantization
+  if (diskMtimeMs > lastReadMtime + 2) {
+    return {
+      stale: true,
+      unread: false,
+      filePath: absPath,
+      reason: `File "${absPath}" was modified on disk since your last read (lastRead=${Math.round(lastReadMtime)}, current=${Math.round(diskMtimeMs)}). Re-read the file before editing to prevent clobbering concurrent changes.`,
     }
-  } catch (err) {
-    if (err) return { stale: false, unread: false, filePath: absPath }
   }
 
   return { stale: false, unread: false, filePath: absPath }

@@ -60,7 +60,7 @@ import { Worktree } from "@opencode/core/worktree"
 import { WorktreeStrategies } from "@opencode/core/worktree/strategies"
 import { Effect, Exit, Layer, Scope } from "effect"
 import { testEffect } from "../lib/effect"
-import { readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PluginTestLayer } from "./fixture"
@@ -573,7 +573,8 @@ itBuiltin.live("opencode-harness built-in edit receipt matches post-Formatter.fi
     // Deterministic external formatter process: real bytes rewritten on disk
     // through the REAL upstream Formatter.file code path (child-process spawn
     // with $FILE replacement), never an in-test copy.
-    const fmtScript = join(tmpdir(), `harness-probe-fmt-${Date.now().toString(36)}.mjs`)
+    const fmtDir = mkdtempSync(join(tmpdir(), "harness-probe-fmt-"))
+    const fmtScript = join(fmtDir, "probe.mjs")
     writeFileSync(
       fmtScript,
       [
@@ -592,7 +593,7 @@ itBuiltin.live("opencode-harness built-in edit receipt matches post-Formatter.fi
         `writeFileSync(target, out.join("\\n") + "\\n")`,
         ``,
       ].join("\n"),
-      "utf8",
+      { mode: 0o600 },
     )
     try {
       const formatter = yield* Formatter.Service
@@ -671,7 +672,7 @@ itBuiltin.live("opencode-harness built-in edit receipt matches post-Formatter.fi
       }
     } finally {
       rmSync(probeAbs, { force: true })
-      rmSync(fmtScript, { force: true })
+      rmSync(fmtDir, { recursive: true, force: true })
     }
   }),
 )

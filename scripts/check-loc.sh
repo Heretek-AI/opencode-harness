@@ -16,12 +16,13 @@
 #   and DOM geometry auditing across 8 waves — roughly 22 modules where the
 #   blueprint assumed a handful. The overage is authorized scope growth, and
 #   further growth is tracked here rather than budgeted by deletion.
-# - Audit-remediation-E revision (2026-10-18): cap unchanged (raw <= 12,100,
-#   stripped <= 10,100). Rationale: OH-4.8 full-set subagent digests + degraded
-#   receipt, OH-6.6 MCP-provenance hardening, and 11 regression tests landed
-#   net-small inside the remediation-D budget (prose tightened in the three
-#   touched files to hold the line); functionality is never deleted to hit a
-#   line count.
+# - Code-scanning remediation revision (2026-10-19): cap revised (raw <= 12176,
+#   stripped <= 10104). Rationale: 13 CodeQL alerts (incomplete sanitization,
+#   TOCTOU snapshots, insecure temp file, 9 polynomial-ReDoS patterns) required
+#   net-new logic — indexOf scan loops, try/catch snapshot paths, mkdtemp
+#   isolation, bounded quantifiers — that cannot be expressed in fewer lines
+#   without deleting functionality (which this budget forbids); the over-cap
+#   gate form still fails the build on any further unchecked growth.
 #
 # OH-scope-loc-budget: by default this script is a tracking signal (exit 0).
 # Pass `--fail-over=<n>` (and/or `--fail-over-stripped=<n>`) to turn the
@@ -53,8 +54,8 @@ done
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARNESS_ROOT"
 
-RAW_BUDGET=12100
-STRIPPED_BUDGET=10100
+RAW_BUDGET=12176
+STRIPPED_BUDGET=10104
 
 raw="$(git ls-files src | xargs wc -l | tail -1 | awk '{print $1}')"
 stripped="$(git ls-files src | xargs cat | grep -vE '^\s*(//|\*|$)' | wc -l)"

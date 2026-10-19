@@ -165,6 +165,15 @@ describe("matchesAnyGlob", () => {
     expect(matchesAnyGlob("test/a.test.ts", ["**/*.test.*"])).toBe(true);
     expect(matchesAnyGlob("src/a.test.ts", ["test/**"])).toBe(false);
   });
+
+  test("escapes every regex metacharacter so *.ts does not match ats (incomplete-sanitization regression)", () => {
+    expect(matchesAnyGlob("ats", ["*.ts"])).toBe(false);
+    expect(matchesAnyGlob("a.ts", ["*.ts"])).toBe(true);
+    expect(matchesAnyGlob("a.ts", ["a.ts"])).toBe(true);
+    expect(matchesAnyGlob("ats", ["a.ts"])).toBe(false);
+    expect(matchesAnyGlob("a(ts)", ["a(ts)"])).toBe(true);
+    expect(matchesAnyGlob("ats", ["a(ts)"])).toBe(false);
+  });
 });
 
 describe("permission-guard Rule 0 (fail-closed safety)", () => {

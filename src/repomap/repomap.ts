@@ -239,11 +239,41 @@ export function stripCommentsAndStringsPreserveLines(source: string): string {
  * Strips comments AND all string literal bodies (`'...'`, `"..."`, `` `...` ``)
  * to spaces of the exact same character length so character offsets and line
  * numbers in the returned mask match the original source 1-to-1.
+ *
+ * Manual single-pass scan (no regex): for each opening `'`/`"` quote, walk to
+ * the first unescaped same-line closing quote and blank the span interior.
+ * Unterminated quotes are left untouched, mirroring the previous
+ * `"(?:\\.|[^"\\\n])*"` / `'(?:\\.|[^'\\\n])*'` replacements character for
+ * character without backtracking.
  */
 export function buildCodeOnlyMask(source: string): string {
-  return stripCommentsAndStringsPreserveLines(source)
-    .replace(/"(?:\\.|[^"\\\n])*"/g, (m) => `"${" ".repeat(Math.max(0, m.length - 2))}"`)
-    .replace(/'(?:\\.|[^'\\\n])*'/g, (m) => `'${" ".repeat(Math.max(0, m.length - 2))}'`);
+  const stripped = stripCommentsAndStringsPreserveLines(source);
+  const chars = stripped.split("");
+  const n = chars.length;
+  let i = 0;
+  while (i < n) {
+    const ch = chars[i];
+    if (ch !== '"' && ch !== "'") {
+      i += 1;
+      continue;
+    }
+    let j = i + 1;
+    while (j < n && chars[j] !== ch && chars[j] !== "\n") {
+      if (chars[j] === "\\") {
+        j += 1;
+      }
+      j += 1;
+    }
+    if (j < n && chars[j] === ch) {
+      for (let k = i + 1; k < j; k++) {
+        chars[k] = " ";
+      }
+      i = j + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return chars.join("");
 }
 
 export function extractOutline(
@@ -267,62 +297,63 @@ export function extractOutline(
     {
       kind: "function",
       regex:
-        /^\s*(export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,
+        /^\s{0,100}(export[ \t]{1,100})?(?:default[ \t]{1,100})?(?:async[ \t]{1,100})?function[ \t]{1,100}([A-Za-z_$][\w$]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "class",
       regex:
-        /^\s*(export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/,
+        /^\s{0,100}(export[ \t]{1,100})?(?:default[ \t]{1,100})?(?:abstract[ \t]{1,100})?class[ \t]{1,100}([A-Za-z_$][\w$]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "interface",
-      regex: /^\s*(export\s+)?interface\s+([A-Za-z_$][\w$]*)/,
+      regex: /^\s{0,100}(export[ \t]{1,100})?interface[ \t]{1,100}([A-Za-z_$][\w$]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "type",
-      regex: /^\s*(export\s+)?type\s+([A-Za-z_$][\w$]*)\s*[=<]/,
+      regex: /^\s{0,100}(export[ \t]{1,100})?type[ \t]{1,100}([A-Za-z_$][\w$]{0,100})[ \t]{0,100}[=<]/,
       exportedGroup: true,
     },
     {
       kind: "enum",
-      regex: /^\s*(export\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)/,
+      regex: /^\s{0,100}(export[ \t]{1,100})?(?:const[ \t]{1,100})?enum[ \t]{1,100}([A-Za-z_$][\w$]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "const",
-      regex: /^\s*(export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=/,
+      regex: /^\s{0,100}(export[ \t]{1,100})?const[ \t]{1,100}([A-Za-z_$][\w$]{0,100})[ \t]{0,100}=/,
       exportedGroup: true,
     },
     {
       kind: "function",
-      regex: /^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(/,
+      regex: /^\s{0,100}(?:async[ \t]{1,100})?def[ \t]{1,100}([A-Za-z_][\w]{0,100})[ \t]{0,100}\(/,
     },
     {
       kind: "function",
-      regex: /^\s*func\s+(?:\([^)]+\)\s+)?([A-Za-z_][\w]*)\s*\(/,
+      regex: /^\s{0,100}func[ \t]{1,100}(?:\([^)]{0,200}\)[ \t]{0,100})?([A-Za-z_][\w]{0,100})[ \t]{0,100}\(/,
     },
     {
       kind: "function",
-      regex: /^\s*(pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][\w]*)/,
+      regex: /^\s{0,100}(pub(?:\([^)]{0,200}\))?[ \t]{1,100})?(?:async[ \t]{1,100})?fn[ \t]{1,100}([A-Za-z_][\w]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "struct",
-      regex: /^\s*(pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][\w]*)/,
+      regex: /^\s{0,100}(pub(?:\([^)]{0,200}\))?[ \t]{1,100})?struct[ \t]{1,100}([A-Za-z_][\w]{0,100})/,
       exportedGroup: true,
     },
     {
       kind: "trait",
-      regex: /^\s*(pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_][\w]*)/,
+      regex: /^\s{0,100}(pub(?:\([^)]{0,200}\))?[ \t]{1,100})?trait[ \t]{1,100}([A-Za-z_][\w]{0,100})/,
       exportedGroup: true,
     },
   ];
 
   for (let idx = 0; idx < lines.length; idx++) {
     const line = lines[idx] ?? "";
+    if (line.length > 1000) continue;
     for (const pat of patterns) {
       const m = pat.regex.exec(line);
       if (!m) continue;

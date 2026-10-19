@@ -274,7 +274,7 @@ function globToRegExp(glob: string): RegExp {
       source += "[^/]";
       index++;
     } else {
-      source += glob[index].replace(/[.*+?^${}()|[\]\\]/, "\\$&");
+      source += glob[index].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       index++;
     }
   }

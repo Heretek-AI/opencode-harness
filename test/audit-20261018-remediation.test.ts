@@ -728,8 +728,8 @@ describe("OH-scope-loc-budget: hard-cap gate form fails over cap", () => {
       "bash",
       [
         "scripts/check-loc.sh",
-        "--fail-over=12100",
-        "--fail-over-stripped=10100",
+        "--fail-over=12176",
+        "--fail-over-stripped=10104",
       ],
       { encoding: "utf8" },
     );

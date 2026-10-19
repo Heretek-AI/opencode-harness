@@ -39,16 +39,38 @@ export function isCompactionAgent(agentName?: string): boolean {
  */
 export function sanitizeCompactionPseudoTranscript(text: string): string {
   if (!text.includes("<recent-context>")) return text
-  return text.replace(
-    /<recent-context>([\s\S]*?)<\/recent-context>/g,
-    (_full, inner: string) => {
-      const cleaned = inner
-        .replace(/^\[Assistant tool call\]:\s*([A-Za-z0-9_:-]+)\((.*)\)$/gm, "  - Invoked tool `$1` with args `$2`")
-        .replace(/^\[Tool result\]:\s*/gm, "  - Tool output: ")
-        .replace(/^\[Tool error\]:\s*/gm, "  - Tool failure: ")
-      return `<recent-context note="historical-summary-only-use-native-tool-calls">${cleaned}</recent-context>`
-    },
-  )
+  const OPEN_TAG = "<recent-context>"
+  const CLOSE_TAG = "</recent-context>"
+  const MAX_INNER_CHARS = 20000
+  let out = ""
+  let cursor = 0
+  while (true) {
+    const openIdx = text.indexOf(OPEN_TAG, cursor)
+    if (openIdx === -1) {
+      out += text.slice(cursor)
+      break
+    }
+    const closeIdx = text.indexOf(CLOSE_TAG, openIdx + OPEN_TAG.length)
+    if (closeIdx === -1) {
+      out += text.slice(cursor)
+      break
+    }
+    const innerStart = openIdx + OPEN_TAG.length
+    const innerEnd = Math.min(closeIdx, innerStart + MAX_INNER_CHARS)
+    const inner = text.slice(innerStart, innerEnd)
+    const cleaned = inner
+      .replace(/^\[Assistant tool call\]:\s*([A-Za-z0-9_:-]+)\((.*)\)$/gm, "  - Invoked tool `$1` with args `$2`")
+      .replace(/^\[Tool result\]:\s*/gm, "  - Tool output: ")
+      .replace(/^\[Tool error\]:\s*/gm, "  - Tool failure: ")
+    out += text.slice(cursor, openIdx)
+    out += `<recent-context note="historical-summary-only-use-native-tool-calls">${cleaned}`
+    if (closeIdx > innerEnd) {
+      out += text.slice(innerEnd, closeIdx)
+    }
+    out += CLOSE_TAG
+    cursor = closeIdx + CLOSE_TAG.length
+  }
+  return out
 }
 
 export interface FileMutationDigest {

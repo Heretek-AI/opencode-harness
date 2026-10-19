@@ -277,10 +277,16 @@ export function scanFileEngineeringQuality(
   const stripped = stripCommentsAndStringsPreserveLines(content);
   const strippedLines = stripped.split("\n");
 
+  const emptyCatchSingleLine =
+    /\bcatch[ \t]{0,100}(?:\([^)]{0,200}\))?[ \t]*\{[ \t]*\}/;
+  const emptyCatchOpener =
+    /\bcatch[ \t]{0,100}(?:\([^)]{0,200}\))?[ \t]*\{[ \t]*$/;
+
   for (let i = 0; i < strippedLines.length; i++) {
     const line = strippedLines[i] ?? "";
+    const mayBeCatch = line.includes("catch");
 
-    if (/\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(line)) {
+    if (mayBeCatch && emptyCatchSingleLine.test(line)) {
       smells.push({
         file: relPath,
         line: i + 1,
@@ -295,7 +301,7 @@ export function scanFileEngineeringQuality(
     // dominant formatting style): track brace depth from the opener; when
     // the block closes with no non-blank content inside, it is the same
     // smell as the single-line form (OH-7.2-multiline-empty-catch-missed).
-    if (/\bcatch\s*(?:\([^)]*\))?\s*\{\s*$/.test(line)) {
+    if (mayBeCatch && emptyCatchOpener.test(line)) {
       let depth = 1;
       let j = i + 1;
       let onlyBlank = true;

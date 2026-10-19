@@ -143,11 +143,14 @@ function suggestSiblingModule(fromAbsPath: string, specifier: string): string | 
 export function parseRelativeImportStatements(
   rawContent: string,
 ): ParsedImportStatement[] {
+  if (rawContent.length > 500000) {
+    rawContent = rawContent.slice(0, 500000);
+  }
   const stripped = stripCommentsAndStringsPreserveLines(rawContent);
   const statements: ParsedImportStatement[] = [];
 
   const stmtRegex =
-    /\b(import|export)\s+(type\s+)?([\s\S]*?)\s+from\s+["'](\.[^"']+)["']/g;
+    /\b(import|export)\s+(type\s+)?([\s\S]{0,2000}?)\s+from\s+["'](\.[^"']{1,500})["']/g;
   let match: RegExpExecArray | null;
 
   while ((match = stmtRegex.exec(stripped)) !== null) {
@@ -169,13 +172,18 @@ export function parseRelativeImportStatements(
     const namedImports: ParsedNamedImport[] = [];
     let hasNamespaceOrDefault = false;
 
-    const braceMatch = /\{([\s\S]*?)\}/.exec(clause);
-    if (braceMatch && braceMatch[1] !== undefined) {
-      const outsideBraces = clause.replace(/\{[\s\S]*?\}/, "").replace(/,/g, "").trim();
+    const braceOpen = clause.indexOf("{");
+    const braceClose = braceOpen === -1 ? -1 : clause.indexOf("}", braceOpen + 1);
+    const braceBody =
+      braceOpen !== -1 && braceClose !== -1 && braceClose - braceOpen - 1 <= 2000
+        ? clause.slice(braceOpen + 1, braceClose)
+        : undefined;
+    if (braceBody !== undefined) {
+      const outsideBraces = (clause.slice(0, braceOpen) + clause.slice(braceClose + 1)).replace(/,/g, "").trim();
       if (outsideBraces.length > 0) {
         hasNamespaceOrDefault = true;
       }
-      const items = braceMatch[1]
+      const items = braceBody
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
@@ -186,7 +194,7 @@ export function parseRelativeImportStatements(
           itemTypeOnly = true;
           cleaned = cleaned.slice(5).trim();
         }
-        const asParts = cleaned.split(/\s+as\s+/);
+        const asParts = cleaned.split(/[ \t]{1,100}as[ \t]{1,100}/);
         const importedName = (asParts[0] ?? "").trim();
         const localName = (asParts[1] ?? importedName).trim();
         if (
@@ -270,13 +278,13 @@ export function collectExportedSymbolNames(
   }
 
   // 3. Export lists: export [type] { a, b as c } [from "..."]
-  const exportListRe = /\bexport\s+(?:type\s+)?\{([\s\S]*?)\}/g;
+  const exportListRe = /\bexport\s+(?:type\s+)?\{([\s\S]{0,2000}?)\}/g;
   while ((m = exportListRe.exec(stripped)) !== null) {
     if (m[1]) {
       for (const item of m[1].split(",")) {
         const cleaned = item.trim().replace(/^type\s+/, "").trim();
         if (!cleaned) continue;
-        const asParts = cleaned.split(/\s+as\s+/);
+        const asParts = cleaned.split(/[ \t]{1,100}as[ \t]{1,100}/);
         const exportedName = (asParts[1] ?? asParts[0] ?? "").trim();
         if (/^[A-Za-z_$][\w$]*$/.test(exportedName)) {
           names.add(exportedName);

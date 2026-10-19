@@ -368,15 +368,21 @@ export async function localizeFaultContext(
   }> = [];
   const seen = new Set<string>();
 
-  const patterns: RegExp[] = [
-    /(?:at\s+[^\n(]+\(|\bat\s+|^\s*)([A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs)):(\d+)(?::(\d+))?/gm,
-    /File\s+"([^"]+\.py)",\s+line\s+(\d+)/g,
-    /-->\s+([A-Za-z0-9_./\\-]+\.rs):(\d+)(?::(\d+))?/g,
-  ];
+  const frameCandidate =
+    /([A-Za-z0-9_./\\-]{1,256}\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs)):(\d{1,7})(?::(\d{1,7}))?/;
+  const pyFileLine = /File\s+"([^"]{1,500}\.py)",\s+line\s+(\d{1,7})/;
+  const rsArrow = /-->\s+([A-Za-z0-9_./\\-]{1,256}\.rs):(\d{1,7})(?::(\d{1,7}))?/;
 
-  for (const regex of patterns) {
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(rawOutput)) !== null) {
+  for (const rawLine of rawOutput.split("\n")) {
+    if (candidates.length >= maxFrames) break;
+    if (!rawLine.includes("at ") && !rawLine.includes("File \"") && !rawLine.includes("-->")) {
+      continue;
+    }
+    const window = rawLine.length > 500 ? rawLine.slice(0, 500) : rawLine;
+    const perLine: RegExp[] = [frameCandidate, pyFileLine, rsArrow];
+    for (const regex of perLine) {
+      const match = regex.exec(window);
+      if (!match) continue;
       const rawPath = match[1];
       const lineNum = Number(match[2]);
       const colNum = match[3] ? Number(match[3]) : undefined;
