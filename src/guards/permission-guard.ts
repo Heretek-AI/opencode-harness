@@ -16,8 +16,12 @@
  *   `git reset --hard`, `git push --force`, `mkfs`, `dd if=` denied for
  *   ALL roles.
  * - Rule 2 (Leadership Read-Only): `director`, `manager`,
- *   `agency-coordinator`, `agency-drift-guard` denied `edit`/`write`/`patch`
+ *   `agency-drift-guard` denied `edit`/`write`/`patch`
  *   and file-mutating shell.
+ * - Rule 2b (Coordinator Source Lock): `agency-coordinator`, `coordinator`
+ *   denied `edit`/`write`/`patch` on `src/**`, `Assets/**`, `Packages/**`
+ *   and workspace-wide edit tools; permitted on docs, spec, and prompt paths,
+ *   with non-destructive shell execution and orchestration tools allowed.
  * - Rule 3 (QA Red-Team Source Lock): `qa-adversary`, `agency-qa` denied
  *   `edit`/`write`/`patch` on `src/**` (`rule-3a-qa-src-lock`) and permitted
  *   only on test, spec, accept-script, and docs paths (`rule-3b-qa-allowlist`
@@ -56,6 +60,10 @@ export interface GuardPolicyConfig {
    * `process.cwd()` when absent so programmatic callers keep working.
    */
   workspaceRoot?: string;
+  /** Roles subject to Rule 2 leadership read-only enforcement. */
+  leadershipRoles?: string[];
+  /** Roles subject to Rule 2b coordinator source lock enforcement. */
+  coordinatorRoles?: string[];
 }
 
 export interface GuardRequest {
@@ -71,11 +79,15 @@ export interface GuardVerdict {
   rule?: string;
 }
 
-const LEADERSHIP_READ_ONLY_ROLES = new Set([
+const DEFAULT_LEADERSHIP_READ_ONLY_ROLES = new Set([
   "director",
   "manager",
-  "agency-coordinator",
   "agency-drift-guard",
+]);
+
+const DEFAULT_COORDINATOR_ROLES = new Set([
+  "agency-coordinator",
+  "coordinator",
 ]);
 
 const QA_RED_TEAM_ROLES = new Set(["qa-adversary", "agency-qa"]);
@@ -90,6 +102,7 @@ const KNOWN_STANDARD_ROLES = new Set([
   "director",
   "manager",
   "agency-coordinator",
+  "coordinator",
   "agency-drift-guard",
   "qa-adversary",
   "agency-qa",
@@ -164,6 +177,14 @@ const READ_TOOL_NAMES = new Set([
 const WORKSPACE_WIDE_EDIT_TOOLS = new Set([
   "rename_symbol",
   "checkpoint_rollback",
+]);
+
+const ORCHESTRATION_TOOL_NAMES = new Set([
+  "subagent",
+  "question",
+  "skill",
+  "websearch",
+  "webfetch",
 ]);
 
 export function defaultGuardConfig(): GuardPolicyConfig {
@@ -574,7 +595,12 @@ export function evaluateBoardGuard(
   if (tool === "") {
     return deny("guard: empty tool name is rejected (fail-closed)", "rule-0-path-safety");
   }
-  if (!isEditTool(tool) && !isShellTool(tool) && !READ_TOOL_NAMES.has(tool)) {
+  if (
+    !isEditTool(tool) &&
+    !isShellTool(tool) &&
+    !READ_TOOL_NAMES.has(tool) &&
+    !ORCHESTRATION_TOOL_NAMES.has(tool)
+  ) {
     return deny(
       `guard: unknown tool ${JSON.stringify(tool)} is rejected for role ${JSON.stringify(role)} (fail-closed)`,
       "rule-0-path-safety",
@@ -624,11 +650,24 @@ export function evaluateBoardGuard(
     }
   }
 
+  const leadershipRoles =
+    policy.leadershipRoles !== undefined
+      ? new Set(policy.leadershipRoles.map(normalizeRoleName))
+      : DEFAULT_LEADERSHIP_READ_ONLY_ROLES;
+
+  const coordinatorRoles =
+    policy.coordinatorRoles !== undefined
+      ? new Set(policy.coordinatorRoles.map(normalizeRoleName))
+      : DEFAULT_COORDINATOR_ROLES;
+
   // Unknown roles fail closed to least privilege: reads and read-only shell
   // stay allowed, but every edit/write/patch and every file-mutating shell
   // command is denied. Roles named in `taskOwnedPaths` count as known.
   const isKnownRole =
-    KNOWN_STANDARD_ROLES.has(role) || policy.taskOwnedPaths?.[role] !== undefined;
+    KNOWN_STANDARD_ROLES.has(role) ||
+    policy.taskOwnedPaths?.[role] !== undefined ||
+    leadershipRoles.has(role) ||
+    coordinatorRoles.has(role);
   if (!isKnownRole) {
     const mutates =
       isEditTool(tool) ||
@@ -641,7 +680,7 @@ export function evaluateBoardGuard(
     }
   }
 
-  if (LEADERSHIP_READ_ONLY_ROLES.has(role)) {
+  if (leadershipRoles.has(role)) {
     if (isEditTool(tool)) {
       return deny(
         `guard: leadership role ${JSON.stringify(role)} is read-only; ${tool} on ${JSON.stringify(path)} denied`,
@@ -652,6 +691,30 @@ export function evaluateBoardGuard(
       return deny(
         `guard: leadership role ${JSON.stringify(role)} is read-only; file-mutating shell denied: ${JSON.stringify(command)}`,
         "rule-2-leadership-read-only",
+      );
+    }
+  }
+
+  if (coordinatorRoles.has(role)) {
+    if (isEditTool(tool) && path !== undefined) {
+      if (
+        path === "src" ||
+        path.startsWith("src/") ||
+        path === "Assets" ||
+        path.startsWith("Assets/") ||
+        path === "Packages" ||
+        path.startsWith("Packages/")
+      ) {
+        return deny(
+          `guard: coordinator role ${JSON.stringify(role)} may not modify production code: ${JSON.stringify(path)}`,
+          "rule-2b-coordinator-src-lock",
+        );
+      }
+    }
+    if (WORKSPACE_WIDE_EDIT_TOOLS.has(tool)) {
+      return deny(
+        `guard: coordinator role ${JSON.stringify(role)} may not run workspace-wide mutation ${tool} (fail-closed)`,
+        "rule-2b-coordinator-src-lock",
       );
     }
   }

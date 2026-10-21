@@ -13,6 +13,7 @@ import {
   shellNamedFileTargets,
   shellRedirectTargets,
   shellTeeTargets,
+  type GuardPolicyConfig,
   type GuardRequest,
 } from "../src/guards/permission-guard";
 import {
@@ -26,8 +27,8 @@ import {
   recordUntrustedContentTaint,
 } from "../src/guards/taint-guard";
 
-function verdict(request: GuardRequest) {
-  return evaluateBoardGuard(request, defaultGuardConfig());
+function verdict(request: GuardRequest, config?: GuardPolicyConfig) {
+  return evaluateBoardGuard(request, config ?? defaultGuardConfig());
 }
 
 describe("shell-parse classifier", () => {
@@ -205,7 +206,7 @@ describe("permission-guard Rule 1 (destructive block)", () => {
 
 describe("permission-guard Rule 2 (leadership read-only)", () => {
   test("denies edits, writes, patches, and mutating shell for leadership", () => {
-    for (const role of ["director", "manager", "agency-coordinator", "agency-drift-guard"]) {
+    for (const role of ["director", "manager", "agency-drift-guard"]) {
       expect(verdict({ role, tool: "edit", path: "docs/plan.md" }).allowed).toBe(false);
       expect(verdict({ role, tool: "write", path: "docs/plan.md" }).allowed).toBe(false);
       expect(verdict({ role, tool: "patch", path: "docs/plan.md" }).allowed).toBe(false);
@@ -220,6 +221,57 @@ describe("permission-guard Rule 2 (leadership read-only)", () => {
     expect(verdict({ role: "agency-drift-guard", tool: "shell", command: "bun test" }).allowed).toBe(
       true,
     );
+  });
+});
+
+describe("permission-guard Rule 2b (coordinator source lock and orchestration)", () => {
+  test("denies direct edits to production code (src, Assets, Packages)", () => {
+    for (const role of ["agency-coordinator", "coordinator"]) {
+      expect(verdict({ role, tool: "edit", path: "src/index.ts" }).allowed).toBe(false);
+      expect(verdict({ role, tool: "write", path: "Assets/Player.cs" }).allowed).toBe(false);
+      expect(verdict({ role, tool: "patch", path: "Packages/manifest.json" }).allowed).toBe(false);
+      expect(verdict({ role, tool: "rename_symbol" }).allowed).toBe(false);
+    }
+  });
+
+  test("permits edits to documentation, specs, and prompts", () => {
+    for (const role of ["agency-coordinator", "coordinator"]) {
+      expect(verdict({ role, tool: "edit", path: "docs/plan.md" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "write", path: "openspec/changes/01.md" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "patch", path: "AGENTS.md" }).allowed).toBe(true);
+    }
+  });
+
+  test("permits orchestration tools (subagent, question, skill)", () => {
+    for (const role of ["agency-coordinator", "coordinator", "builder"]) {
+      expect(verdict({ role, tool: "subagent" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "question" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "skill" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "websearch" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "webfetch" }).allowed).toBe(true);
+    }
+  });
+
+  test("permits coordinator shell execution and denies destructive shell", () => {
+    for (const role of ["agency-coordinator", "coordinator"]) {
+      expect(verdict({ role, tool: "shell", command: "git worktree list" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "shell", command: "gh pr view 5 --json state" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "shell", command: "bun test" }).allowed).toBe(true);
+      expect(verdict({ role, tool: "shell", command: "rm -rf /" }).allowed).toBe(false);
+      expect(verdict({ role, tool: "shell", command: "git reset --hard" }).allowed).toBe(false);
+    }
+  });
+
+  test("honors custom leadershipRoles and coordinatorRoles overrides", () => {
+    const customConfig = {
+      lockedContractGlobs: [],
+      leadershipRoles: ["custom-lead"],
+      coordinatorRoles: ["custom-coord"],
+    };
+    expect(verdict({ role: "custom-lead", tool: "edit", path: "docs/plan.md" }, customConfig).allowed).toBe(false);
+    expect(verdict({ role: "custom-coord", tool: "edit", path: "src/index.ts" }, customConfig).allowed).toBe(false);
+    expect(verdict({ role: "custom-coord", tool: "edit", path: "docs/plan.md" }, customConfig).allowed).toBe(true);
+    expect(verdict({ role: "custom-coord", tool: "shell", command: "git worktree list" }, customConfig).allowed).toBe(true);
   });
 });
 

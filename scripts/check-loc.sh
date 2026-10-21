@@ -23,6 +23,9 @@
 #   isolation, bounded quantifiers — that cannot be expressed in fewer lines
 #   without deleting functionality (which this budget forbids); the over-cap
 #   gate form still fails the build on any further unchecked growth.
+# - Orchestration and coordinator permission remediation revision (2026-10-21):
+#   cap revised (raw <= 12260, stripped <= 10180). Rationale: Rule 0 subagent/
+#   orchestration tool allowances and Rule 2b coordinator source-lock policy.
 #
 # OH-scope-loc-budget: by default this script is a tracking signal (exit 0).
 # Pass `--fail-over=<n>` (and/or `--fail-over-stripped=<n>`) to turn the
@@ -54,8 +57,8 @@ done
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARNESS_ROOT"
 
-RAW_BUDGET=12176
-STRIPPED_BUDGET=10104
+RAW_BUDGET=12260
+STRIPPED_BUDGET=10180
 
 raw="$(git ls-files src | xargs wc -l | tail -1 | awk '{print $1}')"
 stripped="$(git ls-files src | xargs cat | grep -vE '^\s*(//|\*|$)' | wc -l)"
